@@ -1,0 +1,40 @@
+// Arduino CLI build for GyverCore 2.0.4
+// Compile only. No upload and no COM port access.
+// Run with the main .ino file active and saved in Notepad++.
+//
+// Expected sketch layout:
+//   <sketch folder>\<sketch folder>.ino
+//
+// Local paths:
+//   CLI: C:\ArduinoCLI\arduino-cli.exe
+//   GyverCore tools: %LOCALAPPDATA%\Arduino15\packages\GyverCore\hardware\avr\2.0.4\...
+
+NPP_SAVE
+
+// Compile the active sketch into its own directory.
+"C:\\ArduinoCLI\\arduino-cli.exe" compile --fqbn "GyverCore:avr:nano:boot=no,clock=external_16,serial=gyverUart,compiler_version=avrgcc8,timers=yes_millis,init=enable,es=enabled,bod=bod_2_7,co=disabled" --output-dir "$(CURRENT_DIRECTORY)" "$(CURRENT_DIRECTORY)"
+
+// Stop if compilation failed.
+if $(EXITCODE) != 0 then
+    echo BUILD FAILED!
+    exit
+endif
+
+// Create LST from the newly built ELF.
+cmd.exe /c ""%LOCALAPPDATA%\Arduino15\packages\GyverCore\hardware\avr\2.0.4\tools\avr-gcc\bin\avr-objdump.exe" -h -S -C "$(CURRENT_DIRECTORY)\$(NAME_PART).ino.elf" > "$(CURRENT_DIRECTORY)\$(NAME_PART).ino.lst""
+
+if $(EXITCODE) != 0 then
+    echo LST GENERATION FAILED!
+    exit
+endif
+
+// Create SYM from the newly built ELF.
+cmd.exe /c ""%LOCALAPPDATA%\Arduino15\packages\GyverCore\hardware\avr\2.0.4\tools\avr-gcc\bin\avr-nm.exe" -C -n -S "$(CURRENT_DIRECTORY)\$(NAME_PART).ino.elf" > "$(CURRENT_DIRECTORY)\$(NAME_PART).ino.sym""
+
+if $(EXITCODE) != 0 then
+    echo SYM GENERATION FAILED!
+    exit
+endif
+
+echo BUILD SUCCESSFUL!
+echo HEX, ELF, LST and SYM have been generated.
