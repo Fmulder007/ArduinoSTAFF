@@ -12,7 +12,7 @@
 NPP_SAVE
 
 // Compile the active sketch into its own directory.
-"C:\\ArduinoCLI\\arduino-cli.exe" compile --fqbn "GyverCore:avr:nano:boot=no,clock=external_16,serial=gyverUart,compiler_version=avrgcc8,timers=yes_millis,init=enable,es=enabled,bod=bod_2_7,co=disabled" --output-dir "$(CURRENT_DIRECTORY)" "$(CURRENT_DIRECTORY)"
+"C:\ArduinoCLI\arduino-cli.exe" compile --fqbn "GyverCore:avr:nano:boot=no,clock=external_16,serial=gyverUart,compiler_version=avrgcc8,timers=yes_millis,init=enable,es=enabled,bod=bod_2_7,co=disabled" --output-dir "$(CURRENT_DIRECTORY)" "$(CURRENT_DIRECTORY)"
 
 // Stop if compilation failed.
 if $(EXITCODE) != 0 then
