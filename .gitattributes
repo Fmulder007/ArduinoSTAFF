@@ -1,2 +1,4 @@
-# Auto detect text files and perform LF normalization
+# Normalize text files; keep executable/archive files binary.
 * text=auto
+*.exe binary
+*.jar binary
