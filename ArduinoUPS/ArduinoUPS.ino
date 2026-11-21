@@ -27,15 +27,15 @@
 // Настройки измерения аккумулятора
 #define BATTERY_MEASURE_INTERVAL_MS       1000  // Период измерения напряжения АКБ, мс
 #define BATTERY_ADC_SAMPLES                 16  // Количество измерений АЦП для усреднения
-#define BATTERY_ADC_REFERENCE_V           1.10f // Номинал INTERNAL reference; уточнить калибровкой, В
+#define BATTERY_ADC_REFERENCE_MV          1100UL // Опорное напряжение INTERNAL, мВ; уточнить калибровкой
 #define BATTERY_DIVIDER_TOP_OHM         330000UL // Верхний резистор делителя: АКБ+ -> A6, Ом
 #define BATTERY_DIVIDER_BOTTOM_OHM       10000UL // Нижний резистор делителя: A6 -> GND, Ом
 
 // Пороговые напряжения АКБ — позднее будут настраиваться из меню
-#define BATTERY_GENERATOR_STOP_VOLTAGE      0.0f // Запрет генерации ниже этого напряжения; 0 = отсечка отключена
-#define BATTERY_GENERATOR_RECOVERY_VOLTAGE  0.0f // Снятие запрета выше этого напряжения; 0 = отсечка отключена
-#define BATTERY_CHARGE_ON_VOLTAGE           0.0f // Включить заряд ниже этого напряжения; пока не используется
-#define BATTERY_CHARGE_OFF_VOLTAGE          0.0f // Выключить заряд выше этого напряжения; пока не используется
+#define BATTERY_GENERATOR_STOP_CV             0 // Запрет генерации ниже этого напряжения, сотые В; 0 = отсечка отключена
+#define BATTERY_GENERATOR_RECOVERY_CV         0 // Снятие запрета выше этого напряжения, сотые В; 0 = отсечка отключена
+#define BATTERY_CHARGE_ON_CV                  0 // Включить заряд ниже этого напряжения, сотые В; пока не используется
+#define BATTERY_CHARGE_OFF_CV                 0 // Выключить заряд выше этого напряжения, сотые В; пока не используется
 
 // Коды причин запрета генерации. Каждому модулю принадлежит свой бит.
 #define BLOCK_BATTERY_LOW                   0x01 // Бит 0: низкое напряжение аккумулятора
@@ -80,7 +80,7 @@ volatile bool generatorRunning = false;
 volatile uint8_t generatorBlockFlags = 0;
 
 // Последнее измеренное напряжение аккумулятора и время последнего измерения.
-float batteryVoltage = 0.0f;
+uint16_t batteryVoltageCentiV = 0; // Напряжение АКБ в сотых долях вольта: 1234 = 12,34 В
 uint32_t lastBatteryMeasureMs = 0;
 
 // Состояние последовательности событий Timer1.
@@ -181,29 +181,31 @@ void measureBatteryVoltage() {
     adcSum += analogRead(BATTERY_PIN);
   }
 
-  const float adcAverage =
-      static_cast<float>(adcSum) / static_cast<float>(BATTERY_ADC_SAMPLES);
+  // Округляем среднее значение АЦП до целого отсчёта.
+  const uint16_t adcAverage =
+      (adcSum + (BATTERY_ADC_SAMPLES / 2)) / BATTERY_ADC_SAMPLES;
 
-  // INTERNAL reference номинально 1,1 В; коэффициент уточняется калибровкой.
-  const float adcPinVoltage =
-      adcAverage * BATTERY_ADC_REFERENCE_V / 1023.0f;
+  // Коэффициент делителя в сотых: для 330 кОм / 10 кОм получится 3400.
+  const uint32_t dividerRatioX100 =
+      ((BATTERY_DIVIDER_TOP_OHM + BATTERY_DIVIDER_BOTTOM_OHM) * 100UL) /
+      BATTERY_DIVIDER_BOTTOM_OHM;
 
-  const float dividerRatio =
-      static_cast<float>(BATTERY_DIVIDER_TOP_OHM + BATTERY_DIVIDER_BOTTOM_OHM) /
-      static_cast<float>(BATTERY_DIVIDER_BOTTOM_OHM);
-
-  batteryVoltage = adcPinVoltage * dividerRatio;
+  // Результат — сотые доли вольта. Вся арифметика целочисленная.
+  // При текущем делителе промежуточное произведение помещается в uint32_t.
+  batteryVoltageCentiV =
+      (static_cast<uint32_t>(adcAverage) * BATTERY_ADC_REFERENCE_MV *
+       dividerRatioX100) / (1023UL * 1000UL);
 
   // Если оба порога равны нулю, батарейная отсечка пока отключена для макета.
-  if (BATTERY_GENERATOR_STOP_VOLTAGE <= 0.0f &&
-      BATTERY_GENERATOR_RECOVERY_VOLTAGE <= 0.0f) {
+  if (BATTERY_GENERATOR_STOP_CV == 0 &&
+      BATTERY_GENERATOR_RECOVERY_CV == 0) {
     generatorBlockFlags &= static_cast<uint8_t>(~BLOCK_BATTERY_LOW);
     return;
   }
 
   // Если пороги заданы неправильно, оставляем генерацию запрещённой.
-  if (BATTERY_GENERATOR_STOP_VOLTAGE <= 0.0f ||
-      BATTERY_GENERATOR_RECOVERY_VOLTAGE <= BATTERY_GENERATOR_STOP_VOLTAGE) {
+  if (BATTERY_GENERATOR_STOP_CV <= 0 ||
+      BATTERY_GENERATOR_RECOVERY_CV <= BATTERY_GENERATOR_STOP_CV) {
     generatorBlockFlags |= BLOCK_BATTERY_LOW;
     return;
   }
@@ -211,7 +213,7 @@ void measureBatteryVoltage() {
   // Низкое напряжение защёлкивает запрет. Самостоятельное повышение
   // напряжения после снятия нагрузки не снимает BLOCK_BATTERY_LOW.
   // Сброс разрешается отдельно в loop() только после подтверждения сети.
-  if (batteryVoltage <= BATTERY_GENERATOR_STOP_VOLTAGE) {
+  if (batteryVoltageCentiV <= BATTERY_GENERATOR_STOP_CV) {
     generatorBlockFlags |= BLOCK_BATTERY_LOW;
   }
 }
@@ -330,9 +332,9 @@ void loop() {
   // Снять батарейную защёлку можно только при подтверждённой сети
   // и фактическом достижении напряжения восстановления.
   if (mainsPresentConfirmed &&
-      BATTERY_GENERATOR_STOP_VOLTAGE > 0.0f &&
-      BATTERY_GENERATOR_RECOVERY_VOLTAGE > BATTERY_GENERATOR_STOP_VOLTAGE &&
-      batteryVoltage >= BATTERY_GENERATOR_RECOVERY_VOLTAGE) {
+      BATTERY_GENERATOR_STOP_CV > 0 &&
+      BATTERY_GENERATOR_RECOVERY_CV > BATTERY_GENERATOR_STOP_CV &&
+      batteryVoltageCentiV >= BATTERY_GENERATOR_RECOVERY_CV) {
     generatorBlockFlags &= static_cast<uint8_t>(~BLOCK_BATTERY_LOW);
   }
 
