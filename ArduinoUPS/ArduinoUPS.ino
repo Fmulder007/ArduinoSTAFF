@@ -47,13 +47,13 @@ volatile bool generatorRunning = false;
 
 // Состояние последовательности событий Timer1.
 enum TimerPhase : uint8_t {
-  PHASE_DEAD_AFTER_A,
-  PHASE_B_ON,
-  PHASE_DEAD_AFTER_B,
-  PHASE_A_ON
+  EVENT_END_A,    // Окончание импульса A: выключить оба плеча, начать DT.
+  EVENT_START_B,  // Окончание DT: включить плечо B.
+  EVENT_END_B,    // Окончание импульса B: выключить оба плеча, начать DT.
+  EVENT_START_A   // Окончание DT: остановиться или включить плечо A.
 };
 
-volatile TimerPhase timerPhase = PHASE_DEAD_AFTER_A;
+volatile TimerPhase timerPhase = EVENT_END_A;
 
 // Фильтр устойчивых уровней RUN.
 bool runHighTiming = false;
@@ -72,18 +72,17 @@ void stopGenerator() {
   const uint8_t savedSREG = SREG;
   cli();
 
-  // Сначала выключаем оба плеча, затем снимаем разрешение драйверов.
-  TCCR1B = 0;       // Остановить Timer1.
-  TIMSK1 = 0;       // Запретить прерывания Timer1.
-  PORTD &= static_cast<uint8_t>(~BRIDGE_MASK);
-  PORTD &= static_cast<uint8_t>(~DRIVER_EN_MASK);
+  // Остановить Timer1 и одновременно выключить все три управляющих выхода.
+  TCCR1B = 0;
+  TIMSK1 = 0;
+  PORTD &= static_cast<uint8_t>(~OUTPUT_MASK);
 
   // Удалить ожидающее событие сравнения.
   TIFR1 = _BV(OCF1A);
 
   stopRequested = false;
   generatorRunning = false;
-  timerPhase = PHASE_DEAD_AFTER_A;
+  timerPhase = EVENT_END_A;
 
   SREG = savedSREG;
 }
@@ -121,7 +120,7 @@ void startGenerator() {
   OCR1A = activeTicks;
   TIFR1 = _BV(OCF1A) | _BV(TOV1);
 
-  timerPhase = PHASE_DEAD_AFTER_A;
+  timerPhase = EVENT_END_A;
   stopRequested = false;
 
   PORTD &= static_cast<uint8_t>(~BRIDGE_MASK);
@@ -258,29 +257,29 @@ void loop() {
 
 ISR(TIMER1_COMPA_vect) {
   switch (timerPhase) {
-    case PHASE_DEAD_AFTER_A:
-      // Плечо A выключено. Оба плеча остаются закрытыми на время DT.
+    case EVENT_END_A:
+      // Окончился импульс A: выключаем оба плеча и выдерживаем DT.
       PORTD &= static_cast<uint8_t>(~BRIDGE_MASK);
       OCR1A += deadTimeTicks;
-      timerPhase = PHASE_B_ON;
+      timerPhase = EVENT_START_B;
       break;
 
-    case PHASE_B_ON:
-      // После DT включаем плечо B.
+    case EVENT_START_B:
+      // DT после A завершён: включаем плечо B.
       PORTD |= OUT_B_MASK;
       OCR1A += activeTicks;
-      timerPhase = PHASE_DEAD_AFTER_B;
+      timerPhase = EVENT_END_B;
       break;
 
-    case PHASE_DEAD_AFTER_B:
-      // Плечо B выключено. Оба плеча остаются закрытыми на время DT.
+    case EVENT_END_B:
+      // Окончился импульс B: выключаем оба плеча и выдерживаем DT.
       PORTD &= static_cast<uint8_t>(~BRIDGE_MASK);
       OCR1A += deadTimeTicks;
-      timerPhase = PHASE_A_ON;
+      timerPhase = EVENT_START_A;
       break;
 
-    case PHASE_A_ON:
-      // Здесь закончились полный импульс B и следующий за ним DT.
+    case EVENT_START_A:
+      // DT после B завершён: здесь можно завершить полный цикл A+B.
       // Если поступил STOP, завершаем работу до начала нового импульса A.
       if (stopRequested) {
         TCCR1B = 0;  // Остановить Timer1.
@@ -289,14 +288,14 @@ ISR(TIMER1_COMPA_vect) {
         // Оба плеча и разрешение драйверов выключаем.
         PORTD &= static_cast<uint8_t>(~OUTPUT_MASK);
 
-        timerPhase = PHASE_DEAD_AFTER_A;
+        timerPhase = EVENT_END_A;
         stopRequested = false;
         generatorRunning = false;
       } else {
         // Остановка не запрошена — начинаем следующий импульс A.
         PORTD |= OUT_A_MASK;
         OCR1A += activeTicks;
-        timerPhase = PHASE_DEAD_AFTER_A;
+        timerPhase = EVENT_END_A;
       }
       break;
   }
