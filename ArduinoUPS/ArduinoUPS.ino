@@ -4,9 +4,10 @@
 
   ВАЖНО ДЛЯ СБОРКИ:
     GyverCore -> Tools -> System timer -> Disable.
-    В этой конфигурации GyverCore не создаёт периодическое прерывание
-    TIMER0_OVF и не предоставляет millis()/micros().
-    Проект использует собственную временную базу от Timer1.
+    GyverCore -> Tools -> Initialization -> Disable.
+    В этой конфигурации нет системного прерывания TIMER0_OVF и вызова
+    GyverCore init(). Проект сам настраивает GPIO, АЦП и Timer1 и использует
+    собственную временную базу. В конце setup() выполняется sei().
 
   RUN:
     A0 / PC0 — HIGH: генерация запрошена, LOW: сеть появилась.
