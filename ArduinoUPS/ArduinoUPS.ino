@@ -1,44 +1,51 @@
 /*
-  ArduinoUPS — первый испытательный генератор
+  ArduinoUPS — испытательный генератор и контроль АКБ
   Плата: Arduino Nano, ATmega328P, 16 МГц.
 
-  D5 / PD5 — DRIVER_EN: разрешение драйверов, активный HIGH
+  A0 / PC0 — RUN: HIGH = генерация нужна, LOW = сеть появилась
+  A6 / ADC6 — измерение напряжения аккумулятора через делитель
+  D5 / PD5 — DRIVER_EN: общее разрешение драйверов, активный HIGH
   D6 / PD6 — OUT_A: первое плечо, активный HIGH
   D7 / PD7 — OUT_B: второе плечо, активный HIGH
-  A0 / PC0 — RUN: фиксируемая команда работы, HIGH = ВКЛ, LOW = ВЫКЛ
-  A6 / ADC6 — измерение напряжения АКБ через резистивный делитель
+  D8 / PB0 — CHARGE_RELAY: управление реле зарядки, активный HIGH
 
-  До подключения драйверов проверить сигналы осциллографом.
-  На D5, D6 и D7 обязательны внешние подтяжки к GND.
+  На D5, D6, D7 и D8 обязательны внешние подтяжки к GND.
+  До подключения силовой части проверить все сигналы осциллографом.
 */
 
 // ======================================================
 // ПОЛЬЗОВАТЕЛЬСКИЕ НАСТРОЙКИ
 // ======================================================
 
-#define UPS_FREQUENCY_HZ              50  // Частота выходного сигнала, Гц
-#define UPS_DEADTIME_PERCENT          10  // Мёртвое время, % от полупериода
-#define UPS_STARTUP_DELAY_MS        1000  // Пауза после включения, мс
-#define UPS_RUN_FILTER_MS             30  // Фильтр переключения RUN, мс
-#define UPS_DRIVER_ENABLE_DELAY_MS     1  // Пауза после разрешения драйвера, мс
+// Настройки генератора
+#define UPS_FREQUENCY_HZ                    50  // Частота выходного сигнала, Гц
+#define UPS_DEADTIME_PERCENT                10  // Мёртвое время, % от полупериода
+#define UPS_STARTUP_DELAY_MS              1000  // Пауза после включения МК, мс
+#define UPS_RUN_OFF_DELAY_MS              5000  // Время устойчивого RUN=LOW до остановки, мс
+#define UPS_DRIVER_ENABLE_DELAY_MS            1  // Пауза после разрешения драйверов, мс
 
-#define BATTERY_MEASURE_INTERVAL_MS 1000  // Период измерения напряжения АКБ, мс
-#define BATTERY_ADC_SAMPLES           16  // Количество измерений АЦП для усреднения
-#define BATTERY_ADC_REFERENCE_V     5.00f // Опорное напряжение АЦП (AVcc), В
-#define BATTERY_DIVIDER_TOP_OHM   100000UL // Верхний резистор делителя: АКБ+ -> A6, Ом
-#define BATTERY_DIVIDER_BOTTOM_OHM 10000UL // Нижний резистор делителя: A6 -> GND, Ом
-#define BATTERY_MIN_VOLTAGE          0.0f // Нижний порог АКБ, В; 0 = отсечка временно отключена
-#define BATTERY_RECOVERY_MARGIN_V   0.5f // Запас восстановления выше нижнего порога, В
+// Настройки измерения аккумулятора
+#define BATTERY_MEASURE_INTERVAL_MS       1000  // Период измерения напряжения АКБ, мс
+#define BATTERY_ADC_SAMPLES                 16  // Количество измерений АЦП для усреднения
+#define BATTERY_ADC_REFERENCE_V           1.10f // Номинал INTERNAL reference; уточнить калибровкой, В
+#define BATTERY_DIVIDER_TOP_OHM         330000UL // Верхний резистор делителя: АКБ+ -> A6, Ом
+#define BATTERY_DIVIDER_BOTTOM_OHM       10000UL // Нижний резистор делителя: A6 -> GND, Ом
+
+// Пороговые напряжения АКБ — позднее будут настраиваться из меню
+#define BATTERY_GENERATOR_STOP_VOLTAGE      0.0f // Запрет генерации ниже этого напряжения; 0 = отсечка отключена
+#define BATTERY_GENERATOR_RECOVERY_VOLTAGE  0.0f // Снятие запрета выше этого напряжения; 0 = отсечка отключена
+#define BATTERY_CHARGE_ON_VOLTAGE           0.0f // Включить заряд ниже этого напряжения; пока не используется
+#define BATTERY_CHARGE_OFF_VOLTAGE          0.0f // Выключить заряд выше этого напряжения; пока не используется
 
 // Коды причин запрета генерации. Каждому модулю принадлежит свой бит.
-#define BLOCK_BATTERY_LOW             0x01 // Бит 0: низкое напряжение аккумулятора
-#define BLOCK_OVERHEAT                0x02 // Бит 1: перегрев
-#define BLOCK_OVERLOAD                0x04 // Бит 2: перегрузка
-#define BLOCK_MAINS_FAULT             0x08 // Бит 3: неисправность/недопустимое состояние сети
-#define BLOCK_SENSOR_FAULT            0x10 // Бит 4: неисправность датчика
-#define BLOCK_RESERVED_5              0x20 // Бит 5: резерв
-#define BLOCK_RESERVED_6              0x40 // Бит 6: резерв
-#define BLOCK_RESERVED_7              0x80 // Бит 7: резерв
+#define BLOCK_BATTERY_LOW                   0x01 // Бит 0: низкое напряжение аккумулятора
+#define BLOCK_OVERHEAT                      0x02 // Бит 1: перегрев
+#define BLOCK_OVERLOAD                      0x04 // Бит 2: перегрузка
+#define BLOCK_MAINS_FAULT                   0x08 // Бит 3: неисправность/недопустимое состояние сети
+#define BLOCK_SENSOR_FAULT                  0x10 // Бит 4: неисправность датчика
+#define BLOCK_RESERVED_5                   0x20 // Бит 5: резерв
+#define BLOCK_RESERVED_6                   0x40 // Бит 6: резерв
+#define BLOCK_RESERVED_7                   0x80 // Бит 7: резерв
 
 #include <Arduino.h>
 #include <avr/io.h>
@@ -48,27 +55,26 @@
 // ПИНЫ И РАБОЧИЕ ПЕРЕМЕННЫЕ
 // ======================================================
 
-#define RUN_MASK          _BV(PC0)  // A0: вход RUN
+#define RUN_MASK          _BV(PC0)  // A0: вход датчика сети / RUN
 #define BATTERY_PIN       A6        // A6: аналоговый вход измерения АКБ
 #define DRIVER_EN_MASK    _BV(PD5)  // D5: разрешение драйверов
 #define OUT_A_MASK        _BV(PD6)  // D6: первое плечо
 #define OUT_B_MASK        _BV(PD7)  // D7: второе плечо
+#define CHARGE_RELAY_MASK _BV(PB0)  // D8: выход управления реле зарядки
 
 #define OUTPUT_MASK       (DRIVER_EN_MASK | OUT_A_MASK | OUT_B_MASK)
 #define BRIDGE_MASK       (OUT_A_MASK | OUT_B_MASK)
 
 // Время между событиями таймера. Эти значения рассчитываются
-// при запуске из UPS_FREQUENCY_HZ и UPS_DEADTIME_PERCENT.
+// при инициализации из частоты и процента dead time.
 volatile uint16_t activeTicks = 0;
 volatile uint16_t deadTimeTicks = 0;
 
 bool generatorTimingValid = false;
 volatile bool generatorRunning = false;
 
-// Общий байт причин запрета: 0 — генерация разрешена, любое ненулевое
-// значение — запрещена. Каждый модуль меняет только принадлежащий ему бит.
-// До первого измерения установлен батарейный запрет; модуль АКБ обновит
-// только свой бит после первого измерения и проверки настроенного порога.
+// Общий байт причин запрета: 0 — причин запрета нет, любое ненулевое
+// значение запрещает запуск. Каждый модуль меняет только свой бит.
 volatile uint8_t generatorBlockFlags = BLOCK_BATTERY_LOW;
 
 // Последнее измеренное напряжение аккумулятора и время последнего измерения.
@@ -85,10 +91,8 @@ enum TimerPhase : uint8_t {
 
 volatile TimerPhase timerPhase = EVENT_END_A;
 
-// Фильтр устойчивых уровней RUN.
-bool runHighTiming = false;
+// Отсчёт пяти секунд непрерывного RUN=LOW.
 bool runLowTiming = false;
-uint32_t runHighSince = 0;
 uint32_t runLowSince = 0;
 
 // Запрос остановки фиксируется до завершения полного цикла A + B.
@@ -102,12 +106,10 @@ void stopGenerator() {
   const uint8_t savedSREG = SREG;
   cli();
 
-  // Остановить Timer1 и одновременно выключить все три управляющих выхода.
+  // Остановить Timer1 и одновременно выключить DRIVER_EN, OUT_A и OUT_B.
   TCCR1B = 0;
   TIMSK1 = 0;
   PORTD &= static_cast<uint8_t>(~OUTPUT_MASK);
-
-  // Удалить ожидающее событие сравнения.
   TIFR1 = _BV(OCF1A);
 
   stopRequested = false;
@@ -122,7 +124,7 @@ void startGenerator() {
     return;
   }
 
-  // Перед включением драйверов оба плеча гарантированно выключены.
+  // Сначала разрешаем драйверы при закрытых плечах.
   const uint8_t savedSREG = SREG;
   cli();
 
@@ -133,10 +135,9 @@ void startGenerator() {
 
   SREG = savedSREG;
 
-  // Даём драйверам включиться, пока оба силовых плеча закрыты.
   delay(UPS_DRIVER_ENABLE_DELAY_MS);
 
-  // Повторно проверяем RUN и общие запреты после выдержки драйверов.
+  // Если RUN сняли или появился запрет во время выдержки, не запускаемся.
   if ((PINC & RUN_MASK) == 0 || generatorBlockFlags != 0) {
     stopGenerator();
     return;
@@ -145,7 +146,7 @@ void startGenerator() {
   const uint8_t startSREG = SREG;
   cli();
 
-  // Начинаем новый период с плеча A.
+  // Каждый запуск начинается с плеча A.
   TCNT1 = 0;
   OCR1A = activeTicks;
   TIFR1 = _BV(OCF1A) | _BV(TOV1);
@@ -156,10 +157,11 @@ void startGenerator() {
   PORTD &= static_cast<uint8_t>(~BRIDGE_MASK);
   PORTD |= OUT_A_MASK;
 
-  TIMSK1 = _BV(OCIE1A);  // Разрешить прерывание сравнения A.
-  TCCR1B = _BV(CS11);    // Запустить Timer1: Normal mode, делитель 8.
+  TIMSK1 = _BV(OCIE1A);
+  TCCR1B = _BV(CS11);  // Timer1: Normal mode, предделитель 8.
 
   generatorRunning = true;
+  runLowTiming = false;
 
   SREG = startSREG;
 }
@@ -169,8 +171,9 @@ void startGenerator() {
 // ======================================================
 
 void measureBatteryVoltage() {
-  // Усредняем несколько измерений ADC6, чтобы уменьшить шум.
   uint32_t adcSum = 0;
+
+  // Усредняем несколько измерений ADC6.
   for (uint8_t i = 0; i < BATTERY_ADC_SAMPLES; i++) {
     adcSum += analogRead(BATTERY_PIN);
   }
@@ -178,8 +181,7 @@ void measureBatteryVoltage() {
   const float adcAverage =
       static_cast<float>(adcSum) / static_cast<float>(BATTERY_ADC_SAMPLES);
 
-  // Пересчитываем напряжение на A6 в напряжение аккумулятора
-  // с учётом фактического делителя.
+  // INTERNAL reference номинально 1,1 В; коэффициент уточняется калибровкой.
   const float adcPinVoltage =
       adcAverage * BATTERY_ADC_REFERENCE_V / 1023.0f;
 
@@ -189,19 +191,24 @@ void measureBatteryVoltage() {
 
   batteryVoltage = adcPinVoltage * dividerRatio;
 
-  // Нулевой порог означает, что отсечка АКБ пока отключена для испытаний.
-  // Снимаем только батарейный бит; все остальные причины запрета сохраняются.
-  if (BATTERY_MIN_VOLTAGE <= 0.0f) {
+  // Если оба порога равны нулю, батарейная отсечка пока отключена для макета.
+  if (BATTERY_GENERATOR_STOP_VOLTAGE <= 0.0f &&
+      BATTERY_GENERATOR_RECOVERY_VOLTAGE <= 0.0f) {
     generatorBlockFlags &= static_cast<uint8_t>(~BLOCK_BATTERY_LOW);
     return;
   }
 
-  // Гистерезис: запрет включается ниже нижнего порога,
-  // а снимается только после восстановления напряжения с запасом.
-  if (batteryVoltage < BATTERY_MIN_VOLTAGE) {
+  // Если пороги заданы неправильно, оставляем генерацию запрещённой.
+  if (BATTERY_GENERATOR_STOP_VOLTAGE <= 0.0f ||
+      BATTERY_GENERATOR_RECOVERY_VOLTAGE <= BATTERY_GENERATOR_STOP_VOLTAGE) {
     generatorBlockFlags |= BLOCK_BATTERY_LOW;
-  } else if (batteryVoltage >=
-             BATTERY_MIN_VOLTAGE + BATTERY_RECOVERY_MARGIN_V) {
+    return;
+  }
+
+  // Гистерезис: каждый раз меняем только батарейный бит.
+  if (batteryVoltage <= BATTERY_GENERATOR_STOP_VOLTAGE) {
+    generatorBlockFlags |= BLOCK_BATTERY_LOW;
+  } else if (batteryVoltage >= BATTERY_GENERATOR_RECOVERY_VOLTAGE) {
     generatorBlockFlags &= static_cast<uint8_t>(~BLOCK_BATTERY_LOW);
   }
 }
@@ -215,13 +222,18 @@ void setup() {
   const uint8_t savedSREG = SREG;
   cli();
 
-  PORTD &= static_cast<uint8_t>(~OUTPUT_MASK); // Сначала выходные защёлки в LOW.
-  DDRD |= OUTPUT_MASK;                         // Затем включить режим OUTPUT.
+  PORTD &= static_cast<uint8_t>(~OUTPUT_MASK);
+  DDRD |= OUTPUT_MASK;
 
-  // Timer1 должен быть остановлен до отдельной команды запуска.
+  // D8 — выход реле зарядки. Пока зарядное управление не реализовано,
+  // реле всегда остаётся выключенным.
+  PORTB &= static_cast<uint8_t>(~CHARGE_RELAY_MASK);
+  DDRB |= CHARGE_RELAY_MASK;
+
+  // Timer1 полностью остановлен до отдельной команды запуска.
   TIMSK1 = 0;
-  TCCR1A = 0;  // Normal mode, аппаратные выходы сравнения отключены.
-  TCCR1B = 0;  // Нет источника тактирования — таймер остановлен.
+  TCCR1A = 0;
+  TCCR1B = 0;
   TCCR1C = 0;
   TCNT1 = 0;
   OCR1A = 0;
@@ -234,9 +246,9 @@ void setup() {
 
   SREG = savedSREG;
 
-  // Рассчитать временные интервалы для Timer1.
-  // Nano 16 МГц / предделитель 8 = 2 МГц, один отсчёт 0,5 мкс.
-  uint32_t timerClockHz = F_CPU / 8UL;
+  // Рассчитываем интервалы Timer1.
+  // 16 МГц / 8 = 2 МГц; один отсчёт равен 0,5 мкс.
+  const uint32_t timerClockHz = F_CPU / 8UL;
   uint32_t halfPeriodTicks = 0;
   uint32_t calculatedDeadTicks = 0;
   uint32_t calculatedActiveTicks = 0;
@@ -250,8 +262,7 @@ void setup() {
         (halfPeriodTicks * UPS_DEADTIME_PERCENT) / 100UL;
     calculatedActiveTicks = halfPeriodTicks - calculatedDeadTicks;
 
-    // Каждый отдельный интервал должен помещаться в 16-битный Timer1.
-    // Минимум 100 отсчётов оставляет достаточный запас для ISR.
+    // Каждый интервал должен помещаться в 16-битный Timer1.
     if (halfPeriodTicks <= 65535UL &&
         calculatedDeadTicks >= 100UL &&
         calculatedActiveTicks >= 100UL &&
@@ -264,8 +275,18 @@ void setup() {
     }
   }
 
-  // После стартовой выдержки измеряем АКБ до разрешения запуска.
+  // Выбираем внутреннюю опору АЦП ATmega328P — INTERNAL (номинально 1,1 В).
+  analogReference(INTERNAL);
+  delay(5);  // Время на установление внутренней опоры.
+
+  // Первые преобразования после переключения опоры отбрасываем.
+  for (uint8_t i = 0; i < 4; i++) {
+    analogRead(BATTERY_PIN);
+  }
+
+  // Стартовая выдержка перед первой оценкой состояния АКБ и RUN.
   delay(UPS_STARTUP_DELAY_MS);
+
   measureBatteryVoltage();
   lastBatteryMeasureMs = millis();
 }
@@ -279,19 +300,17 @@ void loop() {
   const bool runIsHigh = (PINC & RUN_MASK) != 0;
 
   if (!generatorTimingValid) {
-    // Неверные настройки времени: генератор остаётся выключенным.
     return;
   }
 
-  // Обновляем напряжение аккумулятора раз в секунду.
+  // Измеряем напряжение АКБ раз в секунду, не блокируя Timer1.
   if (now - lastBatteryMeasureMs >= BATTERY_MEASURE_INTERVAL_MS) {
     lastBatteryMeasureMs = now;
     measureBatteryVoltage();
   }
 
   if (generatorRunning) {
-    // Любой установленный бит требует штатной остановки.
-    // Запрос защёлкивается до окончания полного цикла A + B.
+    // Любая причина из общего байта запрещает генерацию без задержки RUN.
     if (generatorBlockFlags != 0) {
       stopRequested = true;
     }
@@ -300,35 +319,25 @@ void loop() {
       return;
     }
 
+    // RUN=LOW трактуем как появление сети только после 5 секунд непрерывного LOW.
     if (!runIsHigh) {
-      // Фильтруем LOW, чтобы дребезг выключателя не создавал STOP.
       if (!runLowTiming) {
         runLowTiming = true;
         runLowSince = now;
-      } else if (now - runLowSince >= UPS_RUN_FILTER_MS) {
+      } else if (now - runLowSince >= UPS_RUN_OFF_DELAY_MS) {
         stopRequested = true;
         runLowTiming = false;
       }
     } else {
+      // Сеть пропала до истечения 5 секунд — отменяем отсчёт остановки.
       runLowTiming = false;
     }
     return;
   }
 
-  // Запуск возможен только при RUN=HIGH и полном отсутствии запретов.
-  if (generatorBlockFlags != 0 || !runIsHigh) {
-    runHighTiming = false;
-    runLowTiming = false;
-    return;
-  }
-
-  // RUN — фиксируемая команда уровня. HIGH может присутствовать ещё
-  // до подачи питания на Arduino; предварительный переход LOW->HIGH не нужен.
-  if (!runHighTiming) {
-    runHighTiming = true;
-    runHighSince = now;
-  } else if (now - runHighSince >= UPS_RUN_FILTER_MS) {
-    runHighTiming = false;
+  // RUN=HIGH включает генерацию сразу, если нет ни одной причины запрета.
+  runLowTiming = false;
+  if (runIsHigh && generatorBlockFlags == 0) {
     startGenerator();
   }
 }
@@ -362,19 +371,17 @@ ISR(TIMER1_COMPA_vect) {
 
     case EVENT_START_A:
       // DT после B завершён: здесь можно завершить полный цикл A+B.
-      // Если поступил STOP, завершаем работу до начала нового импульса A.
       if (stopRequested) {
-        TCCR1B = 0;  // Остановить Timer1.
-        TIMSK1 = 0;  // Запретить дальнейшие прерывания таймера.
+        TCCR1B = 0;
+        TIMSK1 = 0;
 
-        // Оба плеча и разрешение драйверов выключаем.
+        // Все сигналы генератора выключаются только после полного цикла A+B.
         PORTD &= static_cast<uint8_t>(~OUTPUT_MASK);
 
         timerPhase = EVENT_END_A;
         stopRequested = false;
         generatorRunning = false;
       } else {
-        // Остановка не запрошена — начинаем следующий импульс A.
         PORTD |= OUT_A_MASK;
         OCR1A += activeTicks;
         timerPhase = EVENT_END_A;
