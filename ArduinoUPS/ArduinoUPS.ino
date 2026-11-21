@@ -184,17 +184,15 @@ volatile uint8_t generatorBlockFlags = 0;
 // обновления многобайтовых данных. Основной цикл при несовпадении версии
 // просто повторяет чтение на следующем проходе, не запрещая прерывания.
 
-struct SystemTimeSnapshot {
-  uint32_t milliseconds;
-  uint16_t subMillisecondTicks; // 0..1999; один тик = 0,5 мкс
-};
-
 volatile uint8_t systemTimeSequence = 0;
 volatile uint32_t systemMillisBase = 0;
 volatile uint16_t systemSubMsTicks = 0;
 volatile uint16_t systemLastCompare = 0;
 
-static bool tryReadSystemTime(SystemTimeSnapshot &result) {
+// Используем стандартные типы в аргументах: Arduino IDE автоматически
+// создаёт прототипы функций до пользовательских структур.
+static bool tryReadSystemTime(uint32_t &milliseconds,
+                              uint16_t &subMillisecondTicks) {
   const uint8_t versionBefore = systemTimeSequence;
 
   if (versionBefore & 0x01) {
@@ -222,8 +220,8 @@ static bool tryReadSystemTime(SystemTimeSnapshot &result) {
   const uint8_t extraMilliseconds =
       static_cast<uint8_t>(totalSubTicks / 2000U);
 
-  result.milliseconds = baseMillis + extraMilliseconds;
-  result.subMillisecondTicks =
+  milliseconds = baseMillis + extraMilliseconds;
+  subMillisecondTicks =
       static_cast<uint16_t>(totalSubTicks -
                             static_cast<uint16_t>(extraMilliseconds * 2000U));
 
@@ -552,25 +550,26 @@ enum BackgroundTask : uint8_t {
 uint8_t nextBackgroundTask = 0;
 
 void loop() {
-  SystemTimeSnapshot now;
+  uint32_t nowMs = 0;
+  uint16_t subMillisecondTicks = 0;
 
   // Если Timer1 обновлял системное время во время чтения, пробуем на следующем
   // проходе loop(). Никаких cli(), ожидания или повторного цикла здесь нет.
-  if (!tryReadSystemTime(now)) {
+  if (!tryReadSystemTime(nowMs, subMillisecondTicks)) {
     return;
   }
 
   switch (nextBackgroundTask) {
     case TASK_RUN_STATUS:
-      updateRunStatus(now.milliseconds);
+      updateRunStatus(nowMs);
       break;
 
     case TASK_BATTERY_ADC:
-      serviceBatteryMeasurement(now.milliseconds);
+      serviceBatteryMeasurement(nowMs);
       break;
 
     case TASK_STARTUP_GATE:
-      serviceStartupGate(now.milliseconds);
+      serviceStartupGate(nowMs);
       break;
 
     case TASK_BATTERY_RECOVERY:
