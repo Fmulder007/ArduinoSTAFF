@@ -1,139 +1,285 @@
 /*
-  ArduinoUPS — безопасная начальная заготовка
-  Плата: классическая Arduino Nano, ATmega328P, 16 МГц.
+  ArduinoUPS — первый испытательный генератор
+  Плата: Arduino Nano, ATmega328P, 16 МГц.
 
-  D5 / PD5 — DRIVER_EN
-  D6 / PD6 — OUT_A
-  D7 / PD7 — OUT_B
+  D5 / PD5 — DRIVER_EN: разрешение драйверов, активный HIGH
+  D6 / PD6 — OUT_A: первое плечо, активный HIGH
+  D7 / PD7 — OUT_B: второе плечо, активный HIGH
+  A0 / PC0 — RUN: команда работы, активный HIGH
 
-  На всех трёх выходах обязательны внешние подтяжки к GND.
-  Генерация импульсов пока не реализована.
+  До подключения драйверов проверить сигналы осциллографом.
+  На D5, D6 и D7 обязательны внешние подтяжки к GND.
 */
 
 // ======================================================
-// ПОЛЬЗОВАТЕЛЬСКИЕ НАСТРОЙКИ ГЕНЕРАТОРА
-// При будущем добавлении меню эти значения будут изменяться
-// в оперативной памяти без перекомпиляции прошивки.
+// ПОЛЬЗОВАТЕЛЬСКИЕ НАСТРОЙКИ
 // ======================================================
 
-#define UPS_FREQUENCY_HZ       50  // Частота выходного напряжения, Гц
-#define UPS_DEADTIME_PERCENT   10  // Dead time, % от длительности полупериода
+#define UPS_FREQUENCY_HZ              50  // Частота выходного сигнала, Гц
+#define UPS_DEADTIME_PERCENT          10  // Мёртвое время, % от полупериода
+#define UPS_STARTUP_DELAY_MS        1000  // Пауза после включения, мс
+#define UPS_RUN_FILTER_MS             30  // Время подтверждения команды RUN, мс
+#define UPS_DRIVER_ENABLE_DELAY_MS     1  // Пауза после разрешения драйвера, мс
 
 #include <Arduino.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
 
-// Маска только трёх управляющих выходов: PD5, PD6 и PD7.
-const uint8_t UPS_OUTPUT_MASK =
-    _BV(PD5) | _BV(PD6) | _BV(PD7);
+// ======================================================
+// ПИНЫ И РАБОЧИЕ ПЕРЕМЕННЫЕ
+// ======================================================
 
-// Исходные настройки хранятся в обычных переменных RAM.
-// В дальнейшем меню будет менять именно эти переменные.
-struct GeneratorSettings {
-  uint16_t frequencyHz;
-  uint8_t deadTimePercent;
-};
+#define RUN_MASK          _BV(PC0)  // A0: вход RUN
+#define DRIVER_EN_MASK    _BV(PD5)  // D5: разрешение драйверов
+#define OUT_A_MASK        _BV(PD6)  // D6: первое плечо
+#define OUT_B_MASK        _BV(PD7)  // D7: второе плечо
 
-GeneratorSettings generatorSettings = {
-  UPS_FREQUENCY_HZ,
-  UPS_DEADTIME_PERCENT
-};
+#define OUTPUT_MASK       (DRIVER_EN_MASK | OUT_A_MASK | OUT_B_MASK)
+#define BRIDGE_MASK       (OUT_A_MASK | OUT_B_MASK)
 
-// Все производные временные параметры также являются обычными
-// переменными RAM и рассчитываются при инициализации Timer1.
-struct GeneratorTiming {
-  uint32_t halfPeriodTicks;
-  uint16_t activeTicks;
-  uint16_t deadTimeTicks;
-};
+// Время между событиями таймера. Эти значения рассчитываются
+// при запуске из UPS_FREQUENCY_HZ и UPS_DEADTIME_PERCENT.
+volatile uint16_t activeTicks = 0;
+volatile uint16_t deadTimeTicks = 0;
 
-GeneratorTiming generatorTiming = {0, 0, 0};
 bool generatorTimingValid = false;
+bool generatorRunning = false;
 
-// Останавливает и подготавливает Timer1, а также рассчитывает
-// временные параметры из текущих значений generatorSettings.
-// Вызывать только при остановленном генераторе и выключенных выходах.
-bool timer1Initialize() {
-  // Атомарно останавливаем Timer1 и запрещаем его прерывания.
+// Состояние последовательности событий Timer1.
+enum TimerPhase : uint8_t {
+  PHASE_DEAD_AFTER_A,
+  PHASE_B_ON,
+  PHASE_DEAD_AFTER_B,
+  PHASE_A_ON
+};
+
+volatile TimerPhase timerPhase = PHASE_DEAD_AFTER_A;
+
+// Состояние входа RUN и фильтра его переключений.
+bool runArmed = false;
+bool runLowTiming = false;
+bool runHighTiming = false;
+uint32_t runLowSince = 0;
+uint32_t runHighSince = 0;
+
+// ======================================================
+// ЗАПУСК И ОСТАНОВКА ГЕНЕРАТОРА
+// ======================================================
+
+void stopGenerator() {
   const uint8_t savedSREG = SREG;
   cli();
 
-  TIMSK1 = 0;
-  TCCR1A = 0;
+  // Сначала выключаем оба плеча, затем снимаем разрешение драйверов.
+  TCCR1B = 0;       // Остановить Timer1.
+  TIMSK1 = 0;       // Запретить прерывания Timer1.
+  PORTD &= static_cast<uint8_t>(~BRIDGE_MASK);
+  PORTD &= static_cast<uint8_t>(~DRIVER_EN_MASK);
+
+  // Удалить ожидающее событие сравнения.
+  TIFR1 = _BV(OCF1A);
+
+  generatorRunning = false;
+  timerPhase = PHASE_DEAD_AFTER_A;
+
+  SREG = savedSREG;
+}
+
+void startGenerator() {
+  if (!generatorTimingValid || generatorRunning) {
+    return;
+  }
+
+  // Перед включением драйверов оба плеча гарантированно выключены.
+  const uint8_t savedSREG = SREG;
+  cli();
+
   TCCR1B = 0;
+  TIMSK1 = 0;
+  PORTD &= static_cast<uint8_t>(~BRIDGE_MASK);
+  PORTD |= DRIVER_EN_MASK;
+
+  SREG = savedSREG;
+
+  // Даём драйверам включиться, пока оба силовых плеча закрыты.
+  delay(UPS_DRIVER_ENABLE_DELAY_MS);
+
+  // Если RUN успели снять во время задержки, не начинаем генерацию.
+  if ((PINC & RUN_MASK) == 0) {
+    stopGenerator();
+    return;
+  }
+
+  const uint8_t startSREG = SREG;
+  cli();
+
+  // Начинаем новый период с плеча A.
+  TCNT1 = 0;
+  OCR1A = activeTicks;
+  TIFR1 = _BV(OCF1A) | _BV(TOV1);
+
+  timerPhase = PHASE_DEAD_AFTER_A;
+
+  PORTD &= static_cast<uint8_t>(~BRIDGE_MASK);
+  PORTD |= OUT_A_MASK;
+
+  TIMSK1 = _BV(OCIE1A);  // Разрешить прерывание сравнения A.
+  TCCR1B = _BV(CS11);    // Запустить Timer1: Normal mode, делитель 8.
+
+  generatorRunning = true;
+
+  SREG = startSREG;
+}
+
+// ======================================================
+// ИНИЦИАЛИЗАЦИЯ
+// ======================================================
+
+void setup() {
+  // Самое первое действие — принудительно установить D5, D6 и D7 в LOW.
+  const uint8_t savedSREG = SREG;
+  cli();
+
+  PORTD &= static_cast<uint8_t>(~OUTPUT_MASK); // Сначала выходные защёлки в LOW.
+  DDRD |= OUTPUT_MASK;                         // Затем включить режим OUTPUT.
+
+  // Timer1 должен быть остановлен до отдельной команды запуска.
+  TIMSK1 = 0;
+  TCCR1A = 0;  // Normal mode, аппаратные выходы сравнения отключены.
+  TCCR1B = 0;  // Нет источника тактирования — таймер остановлен.
   TCCR1C = 0;
   TCNT1 = 0;
   OCR1A = 0;
   OCR1B = 0;
   TIFR1 = _BV(ICF1) | _BV(OCF1A) | _BV(OCF1B) | _BV(TOV1);
 
-  // Таймер уже остановлен, поэтому дальнейший расчёт можно выполнять
-  // с восстановленными глобальными прерываниями.
+  // A0 / PC0 — вход RUN, внутренняя подтяжка отключена.
+  DDRC &= static_cast<uint8_t>(~RUN_MASK);
+  PORTC &= static_cast<uint8_t>(~RUN_MASK);
+
   SREG = savedSREG;
 
-  // Тактовая частота Timer1: 16 МГц / 8 = 2 МГц.
-  // Делитель /8 — внутренняя настройка реализации, не пользовательский параметр.
+  // Рассчитать временные интервалы для Timer1.
+  // Nano 16 МГц / предделитель 8 = 2 МГц, один отсчёт 0,5 мкс.
   uint32_t timerClockHz = F_CPU / 8UL;
+  uint32_t halfPeriodTicks = 0;
+  uint32_t calculatedDeadTicks = 0;
+  uint32_t calculatedActiveTicks = 0;
 
-  // Проверяем исходные настройки до выполнения деления.
-  if (generatorSettings.frequencyHz == 0 ||
-      generatorSettings.deadTimePercent == 0 ||
-      generatorSettings.deadTimePercent >= 100) {
-    generatorTimingValid = false;
-    return false;
+  if (UPS_FREQUENCY_HZ > 0 &&
+      UPS_DEADTIME_PERCENT > 0 &&
+      UPS_DEADTIME_PERCENT < 100) {
+
+    halfPeriodTicks = timerClockHz / (2UL * UPS_FREQUENCY_HZ);
+    calculatedDeadTicks =
+        (halfPeriodTicks * UPS_DEADTIME_PERCENT) / 100UL;
+    calculatedActiveTicks = halfPeriodTicks - calculatedDeadTicks;
+
+    // Каждый отдельный интервал должен помещаться в 16-битный Timer1.
+    // Минимум 100 отсчётов оставляет достаточный запас для ISR.
+    if (halfPeriodTicks <= 65535UL &&
+        calculatedDeadTicks >= 100UL &&
+        calculatedActiveTicks >= 100UL &&
+        calculatedDeadTicks <= 65535UL &&
+        calculatedActiveTicks <= 65535UL) {
+
+      deadTimeTicks = static_cast<uint16_t>(calculatedDeadTicks);
+      activeTicks = static_cast<uint16_t>(calculatedActiveTicks);
+      generatorTimingValid = true;
+    }
   }
 
-  // Рассчитываем длительность полупериода в отсчётах Timer1.
-  uint32_t halfPeriodTicks =
-      timerClockHz / (2UL * generatorSettings.frequencyHz);
-
-  // Timer1 — 16-битный. Один интервал между событиями должен
-  // помещаться в диапазон счётчика.
-  if (halfPeriodTicks == 0 || halfPeriodTicks > 65535UL) {
-    generatorTimingValid = false;
-    return false;
-  }
-
-  // Рассчитываем dead time и активное время одного плеча.
-  uint32_t deadTimeTicks =
-      (halfPeriodTicks * generatorSettings.deadTimePercent) / 100UL;
-
-  uint32_t activeTicks = halfPeriodTicks - deadTimeTicks;
-
-  if (deadTimeTicks == 0 || activeTicks == 0 ||
-      deadTimeTicks > 65535UL || activeTicks > 65535UL) {
-    generatorTimingValid = false;
-    return false;
-  }
-
-  // Сохраняем результаты в рабочие переменные RAM.
-  generatorTiming.halfPeriodTicks = halfPeriodTicks;
-  generatorTiming.deadTimeTicks = static_cast<uint16_t>(deadTimeTicks);
-  generatorTiming.activeTicks = static_cast<uint16_t>(activeTicks);
-
-  generatorTimingValid = true;
-  return true;
+  // После подачи питания не реагировать на уже установленный RUN=HIGH.
+  delay(UPS_STARTUP_DELAY_MS);
 }
 
-void setup() {
-  // Самое первое действие программы — безопасные уровни выходов.
-  const uint8_t savedSREG = SREG;
-  cli();
-
-  // Сначала записываем LOW, пока выводы ещё находятся в режиме INPUT.
-  PORTD &= static_cast<uint8_t>(~UPS_OUTPUT_MASK);
-
-  // Затем переводим D5, D6 и D7 в режим OUTPUT.
-  DDRD |= UPS_OUTPUT_MASK;
-
-  // Восстанавливаем состояние глобальных прерываний.
-  SREG = savedSREG;
-
-  // Останавливаем Timer1 и рассчитываем его рабочие интервалы.
-  // До отдельной команды запуска счётчик остаётся остановленным.
-  generatorTimingValid = timer1Initialize();
-}
+// ======================================================
+// ОСНОВНОЙ ЦИКЛ
+// ======================================================
 
 void loop() {
-  // Генератор и обработка входов пока не реализованы.
+  const bool runIsHigh = (PINC & RUN_MASK) != 0;
+  const uint32_t now = millis();
+
+  if (!generatorTimingValid) {
+    // Неверные настройки времени: генератор остаётся выключенным.
+    return;
+  }
+
+  if (generatorRunning) {
+    // Снятие RUN немедленно останавливает генератор.
+    if (!runIsHigh) {
+      stopGenerator();
+      runArmed = false;
+      runLowTiming = false;
+      runHighTiming = false;
+    }
+    return;
+  }
+
+  // После включения и после остановки сначала требуется устойчивый RUN=LOW.
+  // Это исключает автоматический запуск, если RUN уже был HIGH при старте.
+  if (!runArmed) {
+    if (!runIsHigh) {
+      if (!runLowTiming) {
+        runLowTiming = true;
+        runLowSince = now;
+      } else if (now - runLowSince >= UPS_RUN_FILTER_MS) {
+        runArmed = true;
+        runLowTiming = false;
+      }
+    } else {
+      runLowTiming = false;
+    }
+    return;
+  }
+
+  // Запускаемся только после устойчивого перехода RUN в HIGH.
+  if (runIsHigh) {
+    if (!runHighTiming) {
+      runHighTiming = true;
+      runHighSince = now;
+    } else if (now - runHighSince >= UPS_RUN_FILTER_MS) {
+      runHighTiming = false;
+      startGenerator();
+    }
+  } else {
+    runHighTiming = false;
+  }
+}
+
+// ======================================================
+// ПРЕРЫВАНИЕ TIMER1 — ЧЕРЕДОВАНИЕ ПЛЕЧ
+// ======================================================
+
+ISR(TIMER1_COMPA_vect) {
+  switch (timerPhase) {
+    case PHASE_DEAD_AFTER_A:
+      // Плечо A выключено. Оба плеча остаются закрытыми на время DT.
+      PORTD &= static_cast<uint8_t>(~BRIDGE_MASK);
+      OCR1A += deadTimeTicks;
+      timerPhase = PHASE_B_ON;
+      break;
+
+    case PHASE_B_ON:
+      // После DT включаем плечо B.
+      PORTD |= OUT_B_MASK;
+      OCR1A += activeTicks;
+      timerPhase = PHASE_DEAD_AFTER_B;
+      break;
+
+    case PHASE_DEAD_AFTER_B:
+      // Плечо B выключено. Оба плеча остаются закрытыми на время DT.
+      PORTD &= static_cast<uint8_t>(~BRIDGE_MASK);
+      OCR1A += deadTimeTicks;
+      timerPhase = PHASE_A_ON;
+      break;
+
+    case PHASE_A_ON:
+      // После DT снова включаем плечо A.
+      PORTD |= OUT_A_MASK;
+      OCR1A += activeTicks;
+      timerPhase = PHASE_DEAD_AFTER_A;
+      break;
+  }
 }
