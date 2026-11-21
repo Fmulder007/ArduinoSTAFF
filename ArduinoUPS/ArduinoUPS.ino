@@ -5,7 +5,7 @@
   D5 / PD5 — DRIVER_EN: разрешение драйверов, активный HIGH
   D6 / PD6 — OUT_A: первое плечо, активный HIGH
   D7 / PD7 — OUT_B: второе плечо, активный HIGH
-  A0 / PC0 — RUN: команда работы, активный HIGH
+  A0 / PC0 — RUN: фиксируемая команда работы, HIGH = ВКЛ, LOW = ВЫКЛ
 
   До подключения драйверов проверить сигналы осциллографом.
   На D5, D6 и D7 обязательны внешние подтяжки к GND.
@@ -55,11 +55,8 @@ enum TimerPhase : uint8_t {
 
 volatile TimerPhase timerPhase = PHASE_DEAD_AFTER_A;
 
-// Состояние входа RUN и фильтра его переключений.
-bool runArmed = false;
-bool runLowTiming = false;
+// Фильтр устойчивого уровня RUN.
 bool runHighTiming = false;
-uint32_t runLowSince = 0;
 uint32_t runHighSince = 0;
 
 // ======================================================
@@ -189,7 +186,8 @@ void setup() {
     }
   }
 
-  // После подачи питания не реагировать на уже установленный RUN=HIGH.
+  // После стартовой выдержки loop() проверяет текущий уровень RUN.
+  // Если RUN уже HIGH, генератор запустится автоматически после фильтрации.
   delay(UPS_STARTUP_DELAY_MS);
 }
 
@@ -207,34 +205,17 @@ void loop() {
   }
 
   if (generatorRunning) {
-    // Снятие RUN немедленно останавливает генератор.
+    // RUN — фиксируемая команда: LOW останавливает генератор.
     if (!runIsHigh) {
       stopGenerator();
-      runArmed = false;
-      runLowTiming = false;
       runHighTiming = false;
     }
     return;
   }
 
-  // После включения и после остановки сначала требуется устойчивый RUN=LOW.
-  // Это исключает автоматический запуск, если RUN уже был HIGH при старте.
-  if (!runArmed) {
-    if (!runIsHigh) {
-      if (!runLowTiming) {
-        runLowTiming = true;
-        runLowSince = now;
-      } else if (now - runLowSince >= UPS_RUN_FILTER_MS) {
-        runArmed = true;
-        runLowTiming = false;
-      }
-    } else {
-      runLowTiming = false;
-    }
-    return;
-  }
-
-  // Запускаемся только после устойчивого перехода RUN в HIGH.
+  // RUN может быть HIGH уже в момент подачи питания.
+  // После стартовой задержки запускаемся по устойчивому уровню HIGH:
+  // предварительно переводить RUN в LOW не требуется.
   if (runIsHigh) {
     if (!runHighTiming) {
       runHighTiming = true;
@@ -244,6 +225,7 @@ void loop() {
       startGenerator();
     }
   } else {
+    // При LOW сбрасываем фильтр и остаёмся в ожидании команды.
     runHighTiming = false;
   }
 }
