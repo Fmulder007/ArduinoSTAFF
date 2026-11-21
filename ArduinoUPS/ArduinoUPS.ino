@@ -91,8 +91,9 @@ enum TimerPhase : uint8_t {
 
 volatile TimerPhase timerPhase = EVENT_END_A;
 
-// Отсчёт пяти секунд непрерывного RUN=LOW.
+// Подтверждение присутствия сети: RUN=LOW должен быть непрерывным 5 секунд.
 bool runLowTiming = false;
+bool mainsPresentConfirmed = false;
 uint32_t runLowSince = 0;
 
 // Запрос остановки фиксируется до завершения полного цикла A + B.
@@ -205,11 +206,11 @@ void measureBatteryVoltage() {
     return;
   }
 
-  // Гистерезис: каждый раз меняем только батарейный бит.
+  // Низкое напряжение защёлкивает запрет. Самостоятельное повышение
+  // напряжения после снятия нагрузки не снимает BLOCK_BATTERY_LOW.
+  // Сброс разрешается отдельно в loop() только после подтверждения сети.
   if (batteryVoltage <= BATTERY_GENERATOR_STOP_VOLTAGE) {
     generatorBlockFlags |= BLOCK_BATTERY_LOW;
-  } else if (batteryVoltage >= BATTERY_GENERATOR_RECOVERY_VOLTAGE) {
-    generatorBlockFlags &= static_cast<uint8_t>(~BLOCK_BATTERY_LOW);
   }
 }
 
@@ -303,40 +304,49 @@ void loop() {
     return;
   }
 
+  // Подтверждаем появление сети только после 5 секунд непрерывного RUN=LOW.
+  // Это же подтверждение используется для разрешения восстановления защёлки АКБ.
+  if (!runIsHigh) {
+    if (!runLowTiming) {
+      runLowTiming = true;
+      runLowSince = now;
+    } else if (now - runLowSince >= UPS_RUN_OFF_DELAY_MS) {
+      mainsPresentConfirmed = true;
+    }
+  } else {
+    // При пропадании сети подтверждение сбрасывается, защёлка АКБ сохраняется.
+    runLowTiming = false;
+    mainsPresentConfirmed = false;
+  }
+
   // Измеряем напряжение АКБ раз в секунду, не блокируя Timer1.
   if (now - lastBatteryMeasureMs >= BATTERY_MEASURE_INTERVAL_MS) {
     lastBatteryMeasureMs = now;
     measureBatteryVoltage();
   }
 
+  // Снять батарейную защёлку можно только при подтверждённой сети
+  // и фактическом достижении напряжения восстановления.
+  if (mainsPresentConfirmed &&
+      BATTERY_GENERATOR_STOP_VOLTAGE > 0.0f &&
+      BATTERY_GENERATOR_RECOVERY_VOLTAGE > BATTERY_GENERATOR_STOP_VOLTAGE &&
+      batteryVoltage >= BATTERY_GENERATOR_RECOVERY_VOLTAGE) {
+    generatorBlockFlags &= static_cast<uint8_t>(~BLOCK_BATTERY_LOW);
+  }
+
   if (generatorRunning) {
     // Любая причина из общего байта запрещает генерацию без задержки RUN.
-    if (generatorBlockFlags != 0) {
+    if (generatorBlockFlags != 0 || mainsPresentConfirmed) {
       stopRequested = true;
     }
 
     if (stopRequested) {
       return;
     }
-
-    // RUN=LOW трактуем как появление сети только после 5 секунд непрерывного LOW.
-    if (!runIsHigh) {
-      if (!runLowTiming) {
-        runLowTiming = true;
-        runLowSince = now;
-      } else if (now - runLowSince >= UPS_RUN_OFF_DELAY_MS) {
-        stopRequested = true;
-        runLowTiming = false;
-      }
-    } else {
-      // Сеть пропала до истечения 5 секунд — отменяем отсчёт остановки.
-      runLowTiming = false;
-    }
     return;
   }
 
   // RUN=HIGH включает генерацию сразу, если нет ни одной причины запрета.
-  runLowTiming = false;
   if (runIsHigh && generatorBlockFlags == 0) {
     startGenerator();
   }
