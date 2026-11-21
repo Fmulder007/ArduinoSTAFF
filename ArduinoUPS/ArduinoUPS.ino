@@ -43,7 +43,7 @@ volatile uint16_t activeTicks = 0;
 volatile uint16_t deadTimeTicks = 0;
 
 bool generatorTimingValid = false;
-bool generatorRunning = false;
+volatile bool generatorRunning = false;
 
 // Состояние последовательности событий Timer1.
 enum TimerPhase : uint8_t {
@@ -55,9 +55,14 @@ enum TimerPhase : uint8_t {
 
 volatile TimerPhase timerPhase = PHASE_DEAD_AFTER_A;
 
-// Фильтр устойчивого уровня RUN.
+// Фильтр устойчивых уровней RUN.
 bool runHighTiming = false;
+bool runLowTiming = false;
 uint32_t runHighSince = 0;
+uint32_t runLowSince = 0;
+
+// Запрос остановки фиксируется до завершения полного цикла A + B.
+volatile bool stopRequested = false;
 
 // ======================================================
 // ЗАПУСК И ОСТАНОВКА ГЕНЕРАТОРА
@@ -76,6 +81,7 @@ void stopGenerator() {
   // Удалить ожидающее событие сравнения.
   TIFR1 = _BV(OCF1A);
 
+  stopRequested = false;
   generatorRunning = false;
   timerPhase = PHASE_DEAD_AFTER_A;
 
@@ -116,6 +122,7 @@ void startGenerator() {
   TIFR1 = _BV(OCF1A) | _BV(TOV1);
 
   timerPhase = PHASE_DEAD_AFTER_A;
+  stopRequested = false;
 
   PORTD &= static_cast<uint8_t>(~BRIDGE_MASK);
   PORTD |= OUT_A_MASK;
@@ -205,18 +212,33 @@ void loop() {
   }
 
   if (generatorRunning) {
-    // RUN — фиксируемая команда: LOW останавливает генератор.
+    // После принятия STOP не отменяем его: заканчиваем пару A + B.
+    if (stopRequested) {
+      return;
+    }
+
     if (!runIsHigh) {
-      stopGenerator();
-      runHighTiming = false;
+      // Фильтруем LOW, чтобы дребезг выключателя не останавливал генератор.
+      if (!runLowTiming) {
+        runLowTiming = true;
+        runLowSince = now;
+      } else if (now - runLowSince >= UPS_RUN_FILTER_MS) {
+        // Просим Timer1 остановиться только после полного импульса B
+        // и следующего за ним интервала dead time.
+        stopRequested = true;
+        runLowTiming = false;
+      }
+    } else {
+      runLowTiming = false;
     }
     return;
   }
 
-  // RUN может быть HIGH уже в момент подачи питания.
-  // После стартовой задержки запускаемся по устойчивому уровню HIGH:
-  // предварительно переводить RUN в LOW не требуется.
+  // Генератор остановлен: RUN работает как обычный фиксируемый выключатель.
+  // Устойчивый HIGH запускает генератор даже если присутствовал при старте Nano.
   if (runIsHigh) {
+    runLowTiming = false;
+
     if (!runHighTiming) {
       runHighTiming = true;
       runHighSince = now;
@@ -225,8 +247,8 @@ void loop() {
       startGenerator();
     }
   } else {
-    // При LOW сбрасываем фильтр и остаёмся в ожидании команды.
     runHighTiming = false;
+    runLowTiming = false;
   }
 }
 
@@ -258,10 +280,24 @@ ISR(TIMER1_COMPA_vect) {
       break;
 
     case PHASE_A_ON:
-      // После DT снова включаем плечо A.
-      PORTD |= OUT_A_MASK;
-      OCR1A += activeTicks;
-      timerPhase = PHASE_DEAD_AFTER_A;
+      // Здесь закончились полный импульс B и следующий за ним DT.
+      // Если поступил STOP, завершаем работу до начала нового импульса A.
+      if (stopRequested) {
+        TCCR1B = 0;  // Остановить Timer1.
+        TIMSK1 = 0;  // Запретить дальнейшие прерывания таймера.
+
+        // Оба плеча и разрешение драйверов выключаем.
+        PORTD &= static_cast<uint8_t>(~OUTPUT_MASK);
+
+        timerPhase = PHASE_DEAD_AFTER_A;
+        stopRequested = false;
+        generatorRunning = false;
+      } else {
+        // Остановка не запрошена — начинаем следующий импульс A.
+        PORTD |= OUT_A_MASK;
+        OCR1A += activeTicks;
+        timerPhase = PHASE_DEAD_AFTER_A;
+      }
       break;
   }
 }
