@@ -1,55 +1,132 @@
 /*
-  ArduinoUPS — early safe-start skeleton
-  Target: classic Arduino Nano, ATmega328P, 16 MHz.
+  ArduinoUPS — безопасная начальная заготовка
+  Плата: классическая Arduino Nano, ATmega328P, 16 МГц.
 
-  Pin map:
-    D5 / PD5 — DRIVER_EN (active HIGH)
-    D6 / PD6 — OUT_A     (active HIGH)
-    D7 / PD7 — OUT_B     (active HIGH)
+  D5 / PD5 — DRIVER_EN
+  D6 / PD6 — OUT_A
+  D7 / PD7 — OUT_B
 
-  External pull-down resistors to GND are required on all three signals.
-  This file intentionally does not generate pulses yet.
+  На всех трёх выходах обязательны внешние подтяжки к GND.
+  Генерация импульсов пока не реализована.
 */
+
+// ======================================================
+// ПОЛЬЗОВАТЕЛЬСКИЕ НАСТРОЙКИ ГЕНЕРАТОРА
+// При будущем добавлении меню эти значения будут изменяться
+// в оперативной памяти без перекомпиляции прошивки.
+// ======================================================
+
+#define UPS_FREQUENCY_HZ       50  // Частота выходного напряжения, Гц
+#define UPS_DEADTIME_PERCENT   10  // Dead time, % от длительности полупериода
 
 #include <Arduino.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
 
-constexpr uint8_t UPS_OUTPUT_MASK =
+// Маска только трёх управляющих выходов: PD5, PD6 и PD7.
+const uint8_t UPS_OUTPUT_MASK =
     _BV(PD5) | _BV(PD6) | _BV(PD7);
 
-void setup() {
-  // Preserve the current interrupt state, then make the first GPIO
-  // operations force all UPS control outputs LOW.
-  const uint8_t savedSREG = SREG;
-  cli();
+// Исходные настройки хранятся в обычных переменных RAM.
+// В дальнейшем меню будет менять именно эти переменные.
+struct GeneratorSettings {
+  uint16_t frequencyHz;
+  uint8_t deadTimePercent;
+};
 
-  // First clear the output latches while the pins are still inputs.
-  PORTD &= static_cast<uint8_t>(~UPS_OUTPUT_MASK);
+GeneratorSettings generatorSettings = {
+  UPS_FREQUENCY_HZ,
+  UPS_DEADTIME_PERCENT
+};
 
-  // Then enable the output drivers. The pins now actively drive LOW.
-  DDRD |= UPS_OUTPUT_MASK;
+// Все производные временные параметры также являются обычными
+// переменными RAM и рассчитываются при инициализации Timer1.
+struct GeneratorTiming {
+  uint32_t halfPeriodTicks;
+  uint16_t activeTicks;
+  uint16_t deadTimeTicks;
+};
 
-  // Keep Timer1 fully stopped and unarmed until the generator is
-  // deliberately implemented and explicitly started.
-  TIMSK1 = 0;  // Disable all Timer1 interrupts.
-  TCCR1A = 0;  // Normal mode; disconnect compare outputs.
-  TCCR1B = 0;  // Clock select = 0: Timer1 stopped.
+GeneratorTiming generatorTiming = {0, 0, 0};
+bool generatorTimingValid = false;
+
+// Останавливает и подготавливает Timer1, а также рассчитывает
+// временные параметры из текущих значений generatorSettings.
+// Вызывать только при остановленном генераторе и выключенных выходах.
+bool timer1Initialize() {
+  // Сначала гарантированно останавливаем и разоружаем Timer1.
+  TIMSK1 = 0;
+  TCCR1A = 0;
+  TCCR1B = 0;
   TCCR1C = 0;
   TCNT1 = 0;
   OCR1A = 0;
   OCR1B = 0;
-
-  // Timer flags are cleared by writing logic one to the corresponding bits.
   TIFR1 = _BV(ICF1) | _BV(OCF1A) | _BV(OCF1B) | _BV(TOV1);
 
-  // Restore the interrupt state that was present on entry to setup().
+  // Тактовая частота Timer1: 16 МГц / 8 = 2 МГц.
+  // Делитель /8 — внутренняя настройка реализации, не пользовательский параметр.
+  const uint32_t timerClockHz = F_CPU / 8UL;
+
+  // Проверяем исходные настройки до выполнения деления.
+  if (generatorSettings.frequencyHz == 0 ||
+      generatorSettings.deadTimePercent == 0 ||
+      generatorSettings.deadTimePercent >= 100) {
+    generatorTimingValid = false;
+    return false;
+  }
+
+  // Рассчитываем длительность полупериода в отсчётах Timer1.
+  const uint32_t halfPeriodTicks =
+      timerClockHz / (2UL * generatorSettings.frequencyHz);
+
+  // Timer1 — 16-битный. Один интервал между событиями должен
+  // помещаться в диапазон счётчика.
+  if (halfPeriodTicks == 0 || halfPeriodTicks > 65535UL) {
+    generatorTimingValid = false;
+    return false;
+  }
+
+  // Рассчитываем dead time и активное время одного плеча.
+  const uint32_t deadTimeTicks =
+      (halfPeriodTicks * generatorSettings.deadTimePercent) / 100UL;
+
+  const uint32_t activeTicks = halfPeriodTicks - deadTimeTicks;
+
+  if (deadTimeTicks == 0 || activeTicks == 0 ||
+      deadTimeTicks > 65535UL || activeTicks > 65535UL) {
+    generatorTimingValid = false;
+    return false;
+  }
+
+  // Сохраняем результаты в рабочие переменные RAM.
+  generatorTiming.halfPeriodTicks = halfPeriodTicks;
+  generatorTiming.deadTimeTicks = static_cast<uint16_t>(deadTimeTicks);
+  generatorTiming.activeTicks = static_cast<uint16_t>(activeTicks);
+
+  generatorTimingValid = true;
+  return true;
+}
+
+void setup() {
+  // Самое первое действие программы — безопасные уровни выходов.
+  const uint8_t savedSREG = SREG;
+  cli();
+
+  // Сначала записываем LOW, пока выводы ещё находятся в режиме INPUT.
+  PORTD &= static_cast<uint8_t>(~UPS_OUTPUT_MASK);
+
+  // Затем переводим D5, D6 и D7 в режим OUTPUT.
+  DDRD |= UPS_OUTPUT_MASK;
+
+  // Восстанавливаем состояние глобальных прерываний.
   SREG = savedSREG;
 
-  // Further initialization will be added only after the startup
-  // sequence and remaining logic are agreed.
+  // Останавливаем Timer1 и рассчитываем его рабочие интервалы.
+  // До отдельной команды запуска счётчик остаётся остановленным.
+  generatorTimingValid = timer1Initialize();
 }
 
 void loop() {
-  // Generator and input handling are not implemented yet.
+  // Генератор и обработка входов пока не реализованы.
 }
