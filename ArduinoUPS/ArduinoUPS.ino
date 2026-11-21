@@ -54,7 +54,10 @@ bool generatorTimingValid = false;
 // временные параметры из текущих значений generatorSettings.
 // Вызывать только при остановленном генераторе и выключенных выходах.
 bool timer1Initialize() {
-  // Сначала гарантированно останавливаем и разоружаем Timer1.
+  // Атомарно останавливаем Timer1 и запрещаем его прерывания.
+  const uint8_t savedSREG = SREG;
+  cli();
+
   TIMSK1 = 0;
   TCCR1A = 0;
   TCCR1B = 0;
@@ -64,9 +67,13 @@ bool timer1Initialize() {
   OCR1B = 0;
   TIFR1 = _BV(ICF1) | _BV(OCF1A) | _BV(OCF1B) | _BV(TOV1);
 
+  // Таймер уже остановлен, поэтому дальнейший расчёт можно выполнять
+  // с восстановленными глобальными прерываниями.
+  SREG = savedSREG;
+
   // Тактовая частота Timer1: 16 МГц / 8 = 2 МГц.
   // Делитель /8 — внутренняя настройка реализации, не пользовательский параметр.
-  const uint32_t timerClockHz = F_CPU / 8UL;
+  uint32_t timerClockHz = F_CPU / 8UL;
 
   // Проверяем исходные настройки до выполнения деления.
   if (generatorSettings.frequencyHz == 0 ||
@@ -77,7 +84,7 @@ bool timer1Initialize() {
   }
 
   // Рассчитываем длительность полупериода в отсчётах Timer1.
-  const uint32_t halfPeriodTicks =
+  uint32_t halfPeriodTicks =
       timerClockHz / (2UL * generatorSettings.frequencyHz);
 
   // Timer1 — 16-битный. Один интервал между событиями должен
@@ -88,10 +95,10 @@ bool timer1Initialize() {
   }
 
   // Рассчитываем dead time и активное время одного плеча.
-  const uint32_t deadTimeTicks =
+  uint32_t deadTimeTicks =
       (halfPeriodTicks * generatorSettings.deadTimePercent) / 100UL;
 
-  const uint32_t activeTicks = halfPeriodTicks - deadTimeTicks;
+  uint32_t activeTicks = halfPeriodTicks - deadTimeTicks;
 
   if (deadTimeTicks == 0 || activeTicks == 0 ||
       deadTimeTicks > 65535UL || activeTicks > 65535UL) {
