@@ -141,7 +141,6 @@ static inline void writeDriverPattern(DriverPattern pattern) {
 // Timer1: Normal mode, предделитель 8.
 // При F_CPU=16 МГц частота таймера 2 МГц, один тик = 0,5 мкс.
 volatile uint16_t activeTicks = 0;
-volatile uint16_t deadTimeTicks = 0;
 volatile uint16_t driverDeadTimeTicks = 0;
 volatile uint16_t interphaseWaitTicks = 0;
 volatile uint16_t periodTicks = 0;
@@ -293,20 +292,30 @@ static void driverControlStep() {
 void updateRunStatus(uint32_t now) {
   // Только эта функция читает физический вход A0/RUN.
   const bool runIsHigh = (PINC & RUN_MASK) != 0;
+  bool runLowConfirmed = false;
 
   if (runIsHigh) {
     runLowTiming = false;
+  } else if (!runLowTiming) {
+    runLowTiming = true;
+    runLowSince = now;
+  } else if (now - runLowSince >= UPS_RUN_OFF_DELAY_MS) {
+    runLowConfirmed = true;
+  }
+
+  // Два флага, которые читает ISR, обновляем атомарно.
+  const uint8_t savedSREG = SREG;
+  cli();
+
+  if (runIsHigh) {
     mainsPresentConfirmed = false;
     generatorRunRequest = true;
-  } else {
-    if (!runLowTiming) {
-      runLowTiming = true;
-      runLowSince = now;
-    } else if (now - runLowSince >= UPS_RUN_OFF_DELAY_MS) {
-      mainsPresentConfirmed = true;
-      generatorRunRequest = false;
-    }
+  } else if (runLowConfirmed) {
+    mainsPresentConfirmed = true;
+    generatorRunRequest = false;
   }
+
+  SREG = savedSREG;
 }
 
 // ======================================================
@@ -481,7 +490,6 @@ void setup() {
         calculatedInterphaseTicks <= 65535UL) {
 
       activeTicks = static_cast<uint16_t>(calculatedActiveTicks);
-      deadTimeTicks = static_cast<uint16_t>(calculatedDeadTicks);
       driverDeadTimeTicks = static_cast<uint16_t>(calculatedDriverDeadTicks);
       interphaseWaitTicks = static_cast<uint16_t>(calculatedInterphaseTicks);
       periodTicks = static_cast<uint16_t>(calculatedPeriodTicks);
