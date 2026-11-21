@@ -6,6 +6,7 @@
   D6 / PD6 — OUT_A: первое плечо, активный HIGH
   D7 / PD7 — OUT_B: второе плечо, активный HIGH
   A0 / PC0 — RUN: фиксируемая команда работы, HIGH = ВКЛ, LOW = ВЫКЛ
+  A6 / ADC6 — измерение напряжения АКБ через резистивный делитель
 
   До подключения драйверов проверить сигналы осциллографом.
   На D5, D6 и D7 обязательны внешние подтяжки к GND.
@@ -18,8 +19,26 @@
 #define UPS_FREQUENCY_HZ              50  // Частота выходного сигнала, Гц
 #define UPS_DEADTIME_PERCENT          10  // Мёртвое время, % от полупериода
 #define UPS_STARTUP_DELAY_MS        1000  // Пауза после включения, мс
-#define UPS_RUN_FILTER_MS             30  // Время подтверждения команды RUN, мс
+#define UPS_RUN_FILTER_MS             30  // Фильтр переключения RUN, мс
 #define UPS_DRIVER_ENABLE_DELAY_MS     1  // Пауза после разрешения драйвера, мс
+
+#define BATTERY_MEASURE_INTERVAL_MS 1000  // Период измерения напряжения АКБ, мс
+#define BATTERY_ADC_SAMPLES           16  // Количество измерений АЦП для усреднения
+#define BATTERY_ADC_REFERENCE_V     5.00f // Опорное напряжение АЦП (AVcc), В
+#define BATTERY_DIVIDER_TOP_OHM   100000UL // Верхний резистор делителя: АКБ+ -> A6, Ом
+#define BATTERY_DIVIDER_BOTTOM_OHM 10000UL // Нижний резистор делителя: A6 -> GND, Ом
+#define BATTERY_MIN_VOLTAGE          0.0f // Нижний порог АКБ, В; 0 = порог не настроен, генерация заблокирована
+#define BATTERY_RECOVERY_MARGIN_V   0.5f // Запас восстановления выше нижнего порога, В
+
+// Коды причин запрета генерации. Каждому модулю принадлежит свой бит.
+#define BLOCK_BATTERY_LOW             0x01 // Бит 0: низкое напряжение аккумулятора
+#define BLOCK_OVERHEAT                0x02 // Бит 1: перегрев
+#define BLOCK_OVERLOAD                0x04 // Бит 2: перегрузка
+#define BLOCK_MAINS_FAULT             0x08 // Бит 3: неисправность/недопустимое состояние сети
+#define BLOCK_SENSOR_FAULT            0x10 // Бит 4: неисправность датчика
+#define BLOCK_RESERVED_5              0x20 // Бит 5: резерв
+#define BLOCK_RESERVED_6              0x40 // Бит 6: резерв
+#define BLOCK_RESERVED_7              0x80 // Бит 7: резерв
 
 #include <Arduino.h>
 #include <avr/io.h>
@@ -30,6 +49,7 @@
 // ======================================================
 
 #define RUN_MASK          _BV(PC0)  // A0: вход RUN
+#define BATTERY_PIN       A6        // A6: аналоговый вход измерения АКБ
 #define DRIVER_EN_MASK    _BV(PD5)  // D5: разрешение драйверов
 #define OUT_A_MASK        _BV(PD6)  // D6: первое плечо
 #define OUT_B_MASK        _BV(PD7)  // D7: второе плечо
@@ -44,6 +64,15 @@ volatile uint16_t deadTimeTicks = 0;
 
 bool generatorTimingValid = false;
 volatile bool generatorRunning = false;
+
+// Общий байт причин запрета: 0 — генерация разрешена, любое ненулевое
+// значение — запрещена. Каждый модуль меняет только принадлежащий ему бит.
+// До первого корректного измерения АКБ запуск запрещён.
+volatile uint8_t generatorBlockFlags = BLOCK_BATTERY_LOW;
+
+// Последнее измеренное напряжение аккумулятора и время последнего измерения.
+float batteryVoltage = 0.0f;
+uint32_t lastBatteryMeasureMs = 0;
 
 // Состояние последовательности событий Timer1.
 enum TimerPhase : uint8_t {
@@ -88,7 +117,7 @@ void stopGenerator() {
 }
 
 void startGenerator() {
-  if (!generatorTimingValid || generatorRunning) {
+  if (!generatorTimingValid || generatorRunning || generatorBlockFlags != 0) {
     return;
   }
 
@@ -106,8 +135,8 @@ void startGenerator() {
   // Даём драйверам включиться, пока оба силовых плеча закрыты.
   delay(UPS_DRIVER_ENABLE_DELAY_MS);
 
-  // Если RUN успели снять во время задержки, не начинаем генерацию.
-  if ((PINC & RUN_MASK) == 0) {
+  // Повторно проверяем RUN и общие запреты после выдержки драйверов.
+  if ((PINC & RUN_MASK) == 0 || generatorBlockFlags != 0) {
     stopGenerator();
     return;
   }
@@ -132,6 +161,48 @@ void startGenerator() {
   generatorRunning = true;
 
   SREG = startSREG;
+}
+
+// ======================================================
+// ИЗМЕРЕНИЕ НАПРЯЖЕНИЯ АККУМУЛЯТОРА
+// ======================================================
+
+void measureBatteryVoltage() {
+  // Усредняем несколько измерений ADC6, чтобы уменьшить шум.
+  uint32_t adcSum = 0;
+  for (uint8_t i = 0; i < BATTERY_ADC_SAMPLES; i++) {
+    adcSum += analogRead(BATTERY_PIN);
+  }
+
+  const float adcAverage =
+      static_cast<float>(adcSum) / static_cast<float>(BATTERY_ADC_SAMPLES);
+
+  // Пересчитываем напряжение на A6 в напряжение аккумулятора
+  // с учётом фактического делителя.
+  const float adcPinVoltage =
+      adcAverage * BATTERY_ADC_REFERENCE_V / 1023.0f;
+
+  const float dividerRatio =
+      static_cast<float>(BATTERY_DIVIDER_TOP_OHM + BATTERY_DIVIDER_BOTTOM_OHM) /
+      static_cast<float>(BATTERY_DIVIDER_BOTTOM_OHM);
+
+  batteryVoltage = adcPinVoltage * dividerRatio;
+
+  // Если порог ещё не задан, батарейный модуль сохраняет запрет.
+  // Это не позволяет случайно запустить инвертор с неизвестными настройками АКБ.
+  if (BATTERY_MIN_VOLTAGE <= 0.0f) {
+    generatorBlockFlags |= BLOCK_BATTERY_LOW;
+    return;
+  }
+
+  // Гистерезис: запрет включается ниже нижнего порога,
+  // а снимается только после восстановления напряжения с запасом.
+  if (batteryVoltage < BATTERY_MIN_VOLTAGE) {
+    generatorBlockFlags |= BLOCK_BATTERY_LOW;
+  } else if (batteryVoltage >=
+             BATTERY_MIN_VOLTAGE + BATTERY_RECOVERY_MARGIN_V) {
+    generatorBlockFlags &= static_cast<uint8_t>(~BLOCK_BATTERY_LOW);
+  }
 }
 
 // ======================================================
@@ -192,9 +263,10 @@ void setup() {
     }
   }
 
-  // После стартовой выдержки loop() проверяет текущий уровень RUN.
-  // Если RUN уже HIGH, генератор запустится автоматически после фильтрации.
+  // После стартовой выдержки измеряем АКБ до разрешения запуска.
   delay(UPS_STARTUP_DELAY_MS);
+  measureBatteryVoltage();
+  lastBatteryMeasureMs = millis();
 }
 
 // ======================================================
@@ -202,28 +274,37 @@ void setup() {
 // ======================================================
 
 void loop() {
-  const bool runIsHigh = (PINC & RUN_MASK) != 0;
   const uint32_t now = millis();
+  const bool runIsHigh = (PINC & RUN_MASK) != 0;
 
   if (!generatorTimingValid) {
     // Неверные настройки времени: генератор остаётся выключенным.
     return;
   }
 
+  // Обновляем напряжение аккумулятора раз в секунду.
+  if (now - lastBatteryMeasureMs >= BATTERY_MEASURE_INTERVAL_MS) {
+    lastBatteryMeasureMs = now;
+    measureBatteryVoltage();
+  }
+
   if (generatorRunning) {
-    // После принятия STOP не отменяем его: заканчиваем пару A + B.
+    // Любой установленный бит требует штатной остановки.
+    // Запрос защёлкивается до окончания полного цикла A + B.
+    if (generatorBlockFlags != 0) {
+      stopRequested = true;
+    }
+
     if (stopRequested) {
       return;
     }
 
     if (!runIsHigh) {
-      // Фильтруем LOW, чтобы дребезг выключателя не останавливал генератор.
+      // Фильтруем LOW, чтобы дребезг выключателя не создавал STOP.
       if (!runLowTiming) {
         runLowTiming = true;
         runLowSince = now;
       } else if (now - runLowSince >= UPS_RUN_FILTER_MS) {
-        // Просим Timer1 остановиться только после полного импульса B
-        // и следующего за ним интервала dead time.
         stopRequested = true;
         runLowTiming = false;
       }
@@ -233,21 +314,21 @@ void loop() {
     return;
   }
 
-  // Генератор остановлен: RUN работает как обычный фиксируемый выключатель.
-  // Устойчивый HIGH запускает генератор даже если присутствовал при старте Nano.
-  if (runIsHigh) {
-    runLowTiming = false;
-
-    if (!runHighTiming) {
-      runHighTiming = true;
-      runHighSince = now;
-    } else if (now - runHighSince >= UPS_RUN_FILTER_MS) {
-      runHighTiming = false;
-      startGenerator();
-    }
-  } else {
+  // Запуск возможен только при RUN=HIGH и полном отсутствии запретов.
+  if (generatorBlockFlags != 0 || !runIsHigh) {
     runHighTiming = false;
     runLowTiming = false;
+    return;
+  }
+
+  // RUN — фиксируемая команда уровня. HIGH может присутствовать ещё
+  // до подачи питания на Arduino; предварительный переход LOW->HIGH не нужен.
+  if (!runHighTiming) {
+    runHighTiming = true;
+    runHighSince = now;
+  } else if (now - runHighSince >= UPS_RUN_FILTER_MS) {
+    runHighTiming = false;
+    startGenerator();
   }
 }
 
