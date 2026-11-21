@@ -36,6 +36,10 @@
 #error "Select GyverCore: Tools -> System timer -> Disable"
 #endif
 
+#if !defined(_GYVERCORE_NOINIT)
+#error "Select GyverCore: Tools -> Initialization -> Disable"
+#endif
+
 #if F_CPU != 16000000UL
 #error "ArduinoUPS timing is configured for ATmega328P at 16 MHz"
 #endif
@@ -694,6 +698,11 @@ void setup() {
     TIMSK1 = _BV(OCIE1A);
     TCCR1B = _BV(CS11);
   }
+
+  // GyverCore init() отключён настройкой _GYVERCORE_NOINIT.
+  // Глобальные прерывания разрешаем только после полной настройки GPIO,
+  // АЦП и Timer1. В рабочем коде cli() не используется.
+  sei();
 }
 
 // ======================================================
