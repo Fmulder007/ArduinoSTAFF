@@ -141,7 +141,7 @@ const uint8_t driverPortPatterns[] PROGMEM = {
   PATTERN_ALL_OFF_VALUE
 };
 
-static inline void writeDriverPattern(DriverPattern pattern) {
+static inline void writeDriverPattern(uint8_t pattern) {
   const uint8_t value =
       pgm_read_byte(&driverPortPatterns[static_cast<uint8_t>(pattern)]);
 
