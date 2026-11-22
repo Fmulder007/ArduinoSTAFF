@@ -30,6 +30,7 @@
 #include <hardware/pio.h>
 
 #include "driver_pio.h"
+#include "status_led.h"
 
 // ======================================================
 // ВЫВОДЫ RP2040-ZERO
@@ -848,6 +849,12 @@ void setup() {
   // Стартовая выдержка из исходной четырёхвыходной версии.
   delay(UPS_STARTUP_DELAY_MS);
 
+  // Встроенный WS2812 на GP16 использует отдельный PIO1.
+  // Ошибка RGB-индикатора не должна останавливать генератор.
+  if (!initializeStatusLed()) {
+    logEvent("LED", "Не удалось инициализировать RGB-индикатор");
+  }
+
   // Первое измерение АКБ выполняется до разрешения генерации.
   measureBatteryVoltage();
   lastBatteryMeasureMs = millis();
@@ -856,6 +863,7 @@ void setup() {
   checkBatteryRecovery();
   logBlockFlagsChanges();
   applyGeneratorPermission();
+  updateStatusLed();
   updateLogDisplay();
 }
 
@@ -880,6 +888,9 @@ void loop() {
   // актуальное разрешение на следующий полный период.
   logBlockFlagsChanges();
   applyGeneratorPermission();
+
+  // RGB-индикатор автономно отображает текущую маску блокировок.
+  updateStatusLed();
 
   // OLED обновляется только после появления новых сообщений.
   updateLogDisplay();
