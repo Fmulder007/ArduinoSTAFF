@@ -122,6 +122,10 @@ uint32_t runLowSince = 0;
 // Последнее разрешение, переданное автомату PIO.
 bool pioRunPermissionApplied = false;
 
+// Фактическое состояние PIO-генератора, доступное другим модулям.
+volatile bool generatorIsRunning = false;
+static int generatorPioSm = -1;
+
 // ======================================================
 // OLED И ЖУРНАЛ
 // ======================================================
@@ -596,6 +600,7 @@ static bool initializePioGenerator() {
   if (sm < 0) {
     return false;
   }
+  generatorPioSm = sm;
 
   const int programOffset =
       pio_add_program_at_offset(pio0, &ups_driver_program, 0);
@@ -727,6 +732,30 @@ static void applyGeneratorPermission() {
   }
 
   pioRunPermissionApplied = permission;
+}
+
+// Обновляем глобальный статус по реальному положению PIO State Machine.
+// PC=wrap_target — точка границы полного периода A+B перед следующим циклом.
+// При разрешённой генерации кратковременное прохождение этой точки не сбрасывает
+// флаг. При снятии разрешения ждём возврата PIO в эту точку после полного периода.
+static void updateGeneratorRunningStatus() {
+  if (generatorPioSm < 0) {
+    generatorIsRunning = false;
+    return;
+  }
+
+  const uint8_t currentPc =
+      pio_sm_get_pc(pio0, static_cast<uint>(generatorPioSm));
+  const bool atPeriodBoundary =
+      currentPc == static_cast<uint8_t>(UPS_DRIVER_PIO_WRAP_TARGET);
+
+  if (pioRunPermissionApplied) {
+    if (!atPeriodBoundary) {
+      generatorIsRunning = true;
+    }
+  } else if (atPeriodBoundary) {
+    generatorIsRunning = false;
+  }
 }
 
 // ======================================================
@@ -865,6 +894,7 @@ void setup() {
   checkBatteryRecovery();
   logBlockFlagsChanges();
   applyGeneratorPermission();
+  updateGeneratorRunningStatus();
   updateStatusLed();
   updateLogDisplay();
 }
@@ -890,8 +920,9 @@ void loop() {
   // актуальное разрешение на следующий полный период.
   logBlockFlagsChanges();
   applyGeneratorPermission();
+  updateGeneratorRunningStatus();
 
-  // RGB-индикатор автономно отображает текущую маску блокировок.
+  // RGB-индикатор отображает блокировки и фактическую работу генератора.
   updateStatusLed();
 
   // OLED обновляется только после появления новых сообщений.
