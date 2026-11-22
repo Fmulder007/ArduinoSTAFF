@@ -644,10 +644,9 @@ static bool initializePioGenerator() {
 
   pio_sm_config config = pio_get_default_sm_config();
 
+  // Сначала настраиваем SET pins и PIO без side-set.
+  // Направления и выходной latch NORMAL задаются до подключения GPIO к PIO.
   sm_config_set_set_pins(&config, PIN_DRIVER_A_H, 4);
-  sm_config_set_sideset(&config, 4, false, false);
-  sm_config_set_sideset_pins(&config, PIN_DRIVER_A_H);
-  sm_config_set_jmp_pin(&config, PIN_PIO_FAULT_LINK);
 
   sm_config_set_wrap(
       &config,
@@ -661,10 +660,6 @@ static bool initializePioGenerator() {
 
   pio_sm_init(pio0, static_cast<uint>(sm), 0, &config);
 
-  for (uint8_t pin = PIN_DRIVER_A_H; pin <= PIN_DRIVER_B_L; ++pin) {
-    pio_gpio_init(pio0, pin);
-  }
-
   if (pio_sm_set_consecutive_pindirs(
           pio0,
           static_cast<uint>(sm),
@@ -674,12 +669,27 @@ static bool initializePioGenerator() {
     return false;
   }
 
-  // NORMAL=1010: оба нижних входа драйверов активны, силовые затворы разряжены.
+  // Предустанавливаем NORMAL=1010 в выходном latch PIO до переключения GPIO mux.
   pio_sm_set_pins_with_mask(
       pio0,
       static_cast<uint>(sm),
       0b1010,
       0x0F);
+
+  // Теперь включаем side-set и JMP PIN. Эти изменения конфигурации
+  // не исполняют PIO-инструкции и не меняют уже подготовленные уровни.
+  sm_config_set_sideset(&config, 4, false, false);
+  sm_config_set_sideset_pins(&config, PIN_DRIVER_A_H);
+  sm_config_set_jmp_pin(&config, PIN_PIO_FAULT_LINK);
+
+  if (pio_sm_set_config(pio0, static_cast<uint>(sm), &config) != 0) {
+    return false;
+  }
+
+  // GPIO переводятся на PIO0 уже с подготовленными направлениями и NORMAL.
+  for (uint8_t pin = PIN_DRIVER_A_H; pin <= PIN_DRIVER_B_L; ++pin) {
+    pio_gpio_init(pio0, pin);
+  }
 
   // TX FIFO: Y — активная длительность, ISR — deadtime, OSR — межфазная пауза.
   pio_sm_put_blocking(pio0, static_cast<uint>(sm), activeLoopCount);
