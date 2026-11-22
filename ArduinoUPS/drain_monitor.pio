@@ -1,0 +1,33 @@
+.program drain_monitor
+
+; GP27=DRAIN_A_FB, GP28=DRAIN_B_FB (IN BASE задан в конфигурации SM).
+; GP0 и GP2 — реальные выходные команды PIO0 на драйверы.
+; GP5 — внутренняя линия аварии PIO1 -> PIO0.
+
+pull block
+wait 1 gpio 0
+mov x, osr
+quarter_a_delay:
+jmp x--, quarter_a_delay
+mov isr, null
+in pins, 2
+mov x, isr
+jmp !x, fault
+
+wait 0 gpio 0
+wait 1 gpio 2
+mov x, osr
+quarter_b_delay:
+jmp x--, quarter_b_delay
+mov isr, null
+in pins, 2
+mov x, isr
+jmp !x, fault
+
+wait 0 gpio 2
+jmp 1
+
+fault:
+set pins, 1
+fault_hold:
+jmp fault_hold
