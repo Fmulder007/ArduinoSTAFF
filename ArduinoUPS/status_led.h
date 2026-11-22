@@ -1,8 +1,12 @@
 /*
   Автономная индикация состояния ArduinoUPS для Waveshare RP2040-Zero.
 
-  Встроенный WS2812 подключён к GP16. Для него используется PIO1,
-  отдельный от PIO0, который формирует сигналы силовых драйверов.
+  Встроенный WS2812 подключён к GP16 (UART0 TX).
+  Передача выполняется UART0 + DMA с инверсией выхода GPIO:
+  PIO0 и PIO1 полностью свободны для силовой автоматики.
+
+  millis() задаёт моменты смены цвета. Передача 24 бит запускается DMA
+  асинхронно; процессор не формирует импульсы и не ждёт окончания кадра.
 
   Функция updateStatusLed() читает generatorBlockFlags и generatorIsRunning.
   Она не изменяет эти флаги и не управляет генератором.
@@ -12,28 +16,31 @@
 
 #include <Arduino.h>
 #include <hardware/clocks.h>
-#include <hardware/pio.h>
+#include <hardware/dma.h>
+#include <hardware/gpio.h>
+#include <hardware/uart.h>
 
 extern volatile uint8_t generatorBlockFlags;
 extern volatile bool generatorIsRunning;
 
 constexpr uint8_t STATUS_LED_PIN = 16;
-constexpr uint32_t STATUS_LED_PIO_FREQUENCY_HZ = 8000000UL;
+constexpr uint32_t STATUS_LED_LATCH_TIME_US = 300UL;
+constexpr uint32_t STATUS_LED_FRAME_GUARD_US = 50UL;
+constexpr uint8_t STATUS_LED_DATA_BITS = 24;
 
-// WS2812: 800 кбит/с, 10 тактов PIO на один бит.
-static const uint16_t statusLedWs2812Instructions[] = {
-  0x6321,  // out x, 1 side 0 [3]
-  0x1223,  // jmp !x, 3 side 1 [2]
-  0x1200,  // jmp 0 side 1 [2]
-  0xA242   // nop side 0 [2]
-};
-
-static const struct pio_program statusLedWs2812Program = {
-  statusLedWs2812Instructions,
-  4,
-  -1,
-  0
-};
+// UART работает в формате 8N1, а выход GP16 инвертирован.
+// Один UART-символ (start + 8 data + stop = 10 бит) формирует один бит WS2812.
+// При clk_peri=125 МГц UART baud = 7,8125 Мбит/с, один UART-бит = 128 нс.
+//
+// После инверсии:
+//   0xFC (UART data LSB first): HIGH 3 бита = 384 нс, LOW 7 = 896 нс.
+//   0xE0 (UART data LSB first): HIGH 6 бит = 768 нс, LOW 4 = 512 нс.
+// Общая длительность каждого бита WS2812 — 1,28 мкс.
+//
+// UART idle/stop после инверсии удерживает линию LOW. DMA заполняет TX FIFO
+// без участия CPU между отдельными байтами.
+constexpr uint8_t STATUS_LED_UART_ZERO = 0xFC;
+constexpr uint8_t STATUS_LED_UART_ONE = 0xE0;
 
 enum StatusLedPhase : uint8_t {
   STATUS_LED_NORMAL_ON,
@@ -44,10 +51,17 @@ enum StatusLedPhase : uint8_t {
   STATUS_LED_ERROR_CYCLE_GAP
 };
 
-static PIO statusLedPio = pio1;
-static int statusLedSm = -1;
-static uint statusLedProgramOffset = 0;
 static bool statusLedReady = false;
+static int statusLedDmaChannel = -1;
+static dma_channel_config statusLedDmaConfig;
+
+static uint8_t statusLedTxBuffer[STATUS_LED_DATA_BITS];
+
+static bool statusLedDmaActive = false;
+static bool statusLedWaitForFrameEnd = false;
+static bool statusLedLatchActive = false;
+static uint32_t statusLedFrameStartedUs = 0;
+static uint32_t statusLedLatchStartedUs = 0;
 
 static bool statusLedStateInitialized = false;
 static uint8_t statusLedLastFlags = 0;
@@ -59,7 +73,7 @@ static uint8_t statusLedCurrentBit = 0;
 static uint8_t statusLedNextBit = 0;
 static uint8_t statusLedPulsesDone = 0;
 
-// Цвет передаётся в формате GRB, который ожидает WS2812.
+// Цвет хранится в порядке GRB, который ожидает WS2812.
 static constexpr uint8_t STATUS_LED_BRIGHTNESS = 32;
 static constexpr uint32_t STATUS_LED_COLOR_OFF = 0x000000UL;
 static constexpr uint32_t STATUS_LED_COLOR_GREEN =
@@ -73,11 +87,12 @@ static uint32_t statusLedNormalColor = STATUS_LED_COLOR_GREEN;
 
 static uint32_t statusLedLastSentColor = 0;
 static uint32_t statusLedPendingColor = 0;
-static uint32_t statusLedLastSendUs = 0;
 static bool statusLedHasSentColor = false;
 static bool statusLedColorPending = false;
 
 static void statusLedRequestColor(uint32_t grbColor) {
+  grbColor &= 0x00FFFFFFUL;
+
   if (statusLedHasSentColor && grbColor == statusLedLastSentColor) {
     statusLedColorPending = false;
     return;
@@ -87,27 +102,78 @@ static void statusLedRequestColor(uint32_t grbColor) {
   statusLedColorPending = true;
 }
 
-// Отправка кадра WS2812 выполняется не чаще одного раза в 100 мкс.
-// Это гарантирует необходимую низкую паузу для фиксации предыдущего цвета.
+static void statusLedEncodeFrame(uint32_t grbColor) {
+  for (uint8_t i = 0; i < STATUS_LED_DATA_BITS; ++i) {
+    const uint8_t bitPosition =
+        static_cast<uint8_t>(23U - i);
+
+    statusLedTxBuffer[i] =
+        (grbColor & (1UL << bitPosition))
+            ? STATUS_LED_UART_ONE
+            : STATUS_LED_UART_ZERO;
+  }
+}
+
+// Запуск кадра и контроль его окончания полностью неблокирующие.
+// После передачи UART оставляет инвертированный TX в LOW для reset/latch.
 static void statusLedServiceOutput() {
-  if (!statusLedReady || !statusLedColorPending) {
+  if (!statusLedReady) {
     return;
   }
 
   const uint32_t nowUs = micros();
 
-  if (statusLedHasSentColor &&
-      static_cast<uint32_t>(nowUs - statusLedLastSendUs) < 100UL) {
+  if (statusLedDmaActive) {
+    if (dma_channel_is_busy(static_cast<uint>(statusLedDmaChannel))) {
+      return;
+    }
+
+    statusLedDmaActive = false;
+    statusLedWaitForFrameEnd = true;
+  }
+
+  if (statusLedWaitForFrameEnd) {
+    // DMA мог заполнить TX FIFO раньше, чем UART физически выдал весь кадр.
+    // Выдерживаем время полного кадра с запасом, не блокируя CPU.
+    if (static_cast<uint32_t>(nowUs - statusLedFrameStartedUs) <
+        STATUS_LED_FRAME_GUARD_US) {
+      return;
+    }
+
+    statusLedWaitForFrameEnd = false;
+    statusLedLatchActive = true;
+    statusLedLatchStartedUs = nowUs;
     return;
   }
 
-  // В FIFO передаётся 24-битное слово GRB в старших 24 битах.
-  pio_sm_put_blocking(
-      statusLedPio,
-      static_cast<uint>(statusLedSm),
-      statusLedPendingColor << 8);
+  if (statusLedLatchActive) {
+    if (static_cast<uint32_t>(nowUs - statusLedLatchStartedUs) <
+        STATUS_LED_LATCH_TIME_US) {
+      return;
+    }
 
-  statusLedLastSendUs = micros();
+    statusLedLatchActive = false;
+  }
+
+  if (!statusLedColorPending) {
+    return;
+  }
+
+  statusLedEncodeFrame(statusLedPendingColor);
+
+  // 24 однобитовых UART-символа передаются DMA в TX FIFO UART0.
+  // DREQ UART0_TX автоматически ограничивает скорость заполнения FIFO.
+  dma_channel_configure(
+      static_cast<uint>(statusLedDmaChannel),
+      &statusLedDmaConfig,
+      &uart_get_hw(uart0)->dr,
+      statusLedTxBuffer,
+      STATUS_LED_DATA_BITS,
+      true);
+
+  statusLedFrameStartedUs = nowUs;
+  statusLedDmaActive = true;
+
   statusLedLastSentColor = statusLedPendingColor;
   statusLedHasSentColor = true;
   statusLedColorPending = false;
@@ -146,75 +212,77 @@ static void statusLedStartPattern(
 }
 
 static bool initializeStatusLed() {
-  // Делитель PIO рассчитывается целочисленно в формате 16.8.
-  const uint64_t divider256 =
-      (static_cast<uint64_t>(clock_get_hz(clk_sys)) * 256ULL +
-       (STATUS_LED_PIO_FREQUENCY_HZ / 2UL)) /
-      STATUS_LED_PIO_FREQUENCY_HZ;
+  if (statusLedReady) {
+    return true;
+  }
 
-  const uint32_t dividerInteger =
-      static_cast<uint32_t>(divider256 / 256ULL);
-
-  const uint8_t dividerFraction =
-      static_cast<uint8_t>(divider256 % 256ULL);
-
-  if (dividerInteger == 0 || dividerInteger > 65535UL) {
+  // UART0 работает на GP16. Его тактовая частота должна позволять
+  // сформировать 10 UART-битов примерно за 1,25 мкс.
+  const uint32_t peripheralClockHz = clock_get_hz(clk_peri);
+  if (peripheralClockHz == 0) {
     return false;
   }
 
-  if (!pio_can_add_program(statusLedPio, &statusLedWs2812Program)) {
+  const uint32_t uartBaud = peripheralClockHz / 16UL;
+  const uint64_t wsBitCellNs =
+      (160000000000ULL + (peripheralClockHz / 2UL)) /
+      peripheralClockHz;
+
+  // Допускаем стандартное окно длительности бита WS2812: 1,25 мкс ± 0,15 мкс.
+  if (wsBitCellNs < 1100ULL || wsBitCellNs > 1400ULL) {
     return false;
   }
 
-  statusLedSm = pio_claim_unused_sm(statusLedPio, false);
-  if (statusLedSm < 0) {
+  statusLedDmaChannel = dma_claim_unused_channel(false);
+  if (statusLedDmaChannel < 0) {
     return false;
   }
 
-  statusLedProgramOffset =
-      pio_add_program(statusLedPio, &statusLedWs2812Program);
+  const uint32_t actualBaud = uart_init(uart0, uartBaud);
+  if (actualBaud == 0) {
+    dma_channel_unclaim(static_cast<uint>(statusLedDmaChannel));
+    statusLedDmaChannel = -1;
+    return false;
+  }
 
-  pio_gpio_init(statusLedPio, STATUS_LED_PIN);
-  pio_sm_set_consecutive_pindirs(
-      statusLedPio,
-      static_cast<uint>(statusLedSm),
-      STATUS_LED_PIN,
-      1,
+  uart_set_format(uart0, 8, 1, UART_PARITY_NONE);
+  uart_set_fifo_enabled(uart0, true);
+
+  // Сначала удерживаем вывод LOW, затем передаём его UART0.
+  // Инверсия превращает UART start/data/stop в импульсы WS2812.
+  gpio_init(STATUS_LED_PIN);
+  gpio_set_dir(STATUS_LED_PIN, GPIO_OUT);
+  gpio_put(STATUS_LED_PIN, false);
+  gpio_set_outover(STATUS_LED_PIN, GPIO_OVERRIDE_LOW);
+  gpio_set_function(STATUS_LED_PIN, GPIO_FUNC_UART);
+  gpio_set_outover(STATUS_LED_PIN, GPIO_OVERRIDE_INVERT);
+
+  statusLedDmaConfig =
+      dma_channel_get_default_config(
+          static_cast<uint>(statusLedDmaChannel));
+
+  channel_config_set_transfer_data_size(
+      &statusLedDmaConfig,
+      DMA_SIZE_8);
+
+  channel_config_set_read_increment(
+      &statusLedDmaConfig,
       true);
 
-  pio_sm_config config = pio_get_default_sm_config();
+  channel_config_set_write_increment(
+      &statusLedDmaConfig,
+      false);
 
-  sm_config_set_wrap(
-      &config,
-      statusLedProgramOffset,
-      statusLedProgramOffset + 3);
-
-  sm_config_set_sideset(&config, 1, false, false);
-  sm_config_set_sideset_pins(&config, STATUS_LED_PIN);
-  sm_config_set_out_shift(&config, false, true, 24);
-  sm_config_set_fifo_join(&config, PIO_FIFO_JOIN_TX);
-
-  sm_config_set_clkdiv_int_frac8(
-      &config,
-      static_cast<uint16_t>(dividerInteger),
-      dividerFraction);
-
-  pio_sm_init(
-      statusLedPio,
-      static_cast<uint>(statusLedSm),
-      statusLedProgramOffset,
-      &config);
-
-  pio_sm_set_enabled(
-      statusLedPio,
-      static_cast<uint>(statusLedSm),
-      true);
+  channel_config_set_dreq(
+      &statusLedDmaConfig,
+      uart_get_dreq(uart0, true));
 
   statusLedReady = true;
   return true;
 }
 
-// Вызывать из loop() постоянно. Все интервалы неблокирующие.
+// Вызывать из loop() постоянно. millis() управляет рисунком,
+// а UART0 + DMA отправляют каждый кадр асинхронно.
 static void updateStatusLed() {
   if (!statusLedReady) {
     return;
@@ -225,7 +293,7 @@ static void updateStatusLed() {
   const bool generatorRunning = generatorIsRunning;
 
   // Красный код зависит только от маски блокировок.
-  // Изменение generatorIsRunning не сбрасывает и не меняет красную последовательность.
+  // Изменение generatorIsRunning не сбрасывает красную последовательность.
   const bool flagsChanged =
       !statusLedStateInitialized || flags != statusLedLastFlags;
   const bool normalStateChanged =
@@ -243,7 +311,8 @@ static void updateStatusLed() {
     return;
   }
 
-  // Запоминаем состояние и во время красного кода, но не меняем его рисунок.
+  // Во время красной последовательности изменение флага генератора
+  // запоминается, но не меняет рисунок красных вспышек.
   statusLedLastGeneratorRunning = generatorRunning;
 
   switch (statusLedPhase) {
