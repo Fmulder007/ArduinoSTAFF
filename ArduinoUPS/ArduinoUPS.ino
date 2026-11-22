@@ -12,8 +12,8 @@
     GP26 — измерение напряжения аккумулятора, ADC0.
 
   OLED SSD1306 128x32 и будущие часы DS1307:
-    GP6 — I2C1 SDA (Wire1).
-    GP7 — I2C1 SCL (Wire1).
+    GP8 — I2C0 SDA (Wire).
+    GP9 — I2C0 SCL (Wire).
 
   Пока дисплей показывает только журнал событий.
   Дата/время временно заменены заглушкой до подключения DS1307.
@@ -25,7 +25,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <U8g2lib.h>
+#include "src/libraries/GyverOLED/src/GyverOLED.h"
 #include <hardware/clocks.h>
 #include <hardware/pio.h>
 
@@ -41,8 +41,8 @@ constexpr uint8_t PIN_DRIVER_B_H = 2;  // GP2
 constexpr uint8_t PIN_DRIVER_B_L = 3;  // GP3
 
 constexpr uint8_t PIN_RUN = 4;         // GP4
-constexpr uint8_t PIN_I2C_SDA = 6;     // GP6 / I2C1 SDA
-constexpr uint8_t PIN_I2C_SCL = 7;     // GP7 / I2C1 SCL
+constexpr uint8_t PIN_I2C_SDA = 8;     // GP8 / I2C0 SDA
+constexpr uint8_t PIN_I2C_SCL = 9;     // GP9 / I2C0 SCL
 constexpr uint8_t PIN_BATTERY = 26;    // GP26 / ADC0
 
 // ======================================================
@@ -123,9 +123,12 @@ bool pioRunPermissionApplied = false;
 // OLED И ЖУРНАЛ
 // ======================================================
 
-// SSD1306 128x32, полный буфер 512 байт, второй аппаратный I2C — Wire1.
-// Адрес определяется при старте: сначала 0x3C, затем 0x3D.
-U8G2_SSD1306_128X32_UNIVISION_F_2ND_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+// GyverOLED 1.6.4, SSD1306 128x32, программный буфер 512 байт.
+// Два экземпляра нужны для сохранения автоматического выбора адреса 0x3C/0x3D.
+using OledType = GyverOLED<SSD1306_128x32, OLED_BUFFER>;
+OledType oled3C(0x3C);
+OledType oled3D(0x3D);
+OledType *oled = nullptr;
 
 constexpr uint8_t OLED_ADDRESS_1 = 0x3C;
 constexpr uint8_t OLED_ADDRESS_2 = 0x3D;
@@ -134,6 +137,7 @@ constexpr uint32_t I2C_CLOCK_HZ = 100000UL;
 constexpr uint8_t LOG_HISTORY_LINES = 20;
 constexpr size_t LOG_LINE_BYTES = 96;
 constexpr uint8_t OLED_VISIBLE_LINES = 4;
+constexpr uint8_t OLED_LINE_CHARS = 21;
 
 char logHistory[LOG_HISTORY_LINES][LOG_LINE_BYTES];
 uint8_t logHistoryHead = 0;
@@ -203,8 +207,9 @@ static uint8_t utf8CharacterBytes(uint8_t firstByte) {
   return 1;
 }
 
-// Перенос выполняется по границам UTF-8 символов.
-// Кириллические буквы никогда не разрезаются между строками.
+// GyverOLED печатает UTF-8 кириллицу через Print.
+// Делим журнал на строки по 21 символу (6 пикселей на знак).
+// Разрезать многобайтный UTF-8 символ между строками нельзя.
 static void appendWrappedDisplayText(const char *text) {
   if (!oledReady) {
     return;
@@ -212,40 +217,43 @@ static void appendWrappedDisplayText(const char *text) {
 
   char line[LOG_LINE_BYTES];
   size_t lineLength = 0;
+  uint8_t characterCount = 0;
   line[0] = '\0';
 
   const uint8_t *source = reinterpret_cast<const uint8_t *>(text);
 
   while (*source != 0) {
-    const uint8_t characterLength = utf8CharacterBytes(*source);
+    uint8_t characterLength = utf8CharacterBytes(*source);
+
+    if (characterLength > 1) {
+      for (uint8_t i = 1; i < characterLength; ++i) {
+        if (source[i] == 0 || (source[i] & 0xC0) != 0x80) {
+          characterLength = 1;
+          break;
+        }
+      }
+    }
 
     if (lineLength + characterLength >= sizeof(line)) {
       line[lineLength] = '\0';
       appendDisplayLine(line);
       lineLength = 0;
-      line[0] = '\0';
+      characterCount = 0;
     }
-
-    const size_t previousLength = lineLength;
 
     for (uint8_t i = 0; i < characterLength; ++i) {
       line[lineLength++] = static_cast<char>(source[i]);
     }
     line[lineLength] = '\0';
-
-    // Проверяем фактическую ширину строки выбранным шрифтом.
-    if (oled.getUTF8Width(line) > 128 && previousLength > 0) {
-      line[previousLength] = '\0';
-      appendDisplayLine(line);
-
-      lineLength = 0;
-      for (uint8_t i = 0; i < characterLength; ++i) {
-        line[lineLength++] = static_cast<char>(source[i]);
-      }
-      line[lineLength] = '\0';
-    }
-
     source += characterLength;
+    characterCount++;
+
+    if (characterCount >= OLED_LINE_CHARS) {
+      appendDisplayLine(line);
+      lineLength = 0;
+      characterCount = 0;
+      line[0] = '\0';
+    }
   }
 
   if (lineLength > 0) {
@@ -254,13 +262,13 @@ static void appendWrappedDisplayText(const char *text) {
 }
 
 static void updateLogDisplay() {
-  if (!oledReady || !oledDirty) {
+  if (!oledReady || !oledDirty || oled == nullptr) {
     return;
   }
 
-  oled.clearBuffer();
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
-  oled.setFontPosTop();
+  oled->clear();
+  oled->setScale(1);
+  oled->autoPrintln(false);
 
   uint8_t visibleCount = logHistoryCount;
   if (visibleCount > OLED_VISIBLE_LINES) {
@@ -278,13 +286,11 @@ static void updateLogDisplay() {
     const uint8_t index =
         (oldestIndex + firstVisible + row) % LOG_HISTORY_LINES;
 
-    oled.drawUTF8(
-        0,
-        static_cast<uint8_t>(row * 8),
-        logHistory[index]);
+    oled->setCursor(0, row);
+    oled->print(logHistory[index]);
   }
 
-  oled.sendBuffer();
+  oled->update();
   oledDirty = false;
 }
 
@@ -311,46 +317,42 @@ static void logEvent(const char *tag, const char *message) {
 }
 
 // ======================================================
-// ИНИЦИАЛИЗАЦИЯ OLED НА I2C1
+// ИНИЦИАЛИЗАЦИЯ OLED НА I2C0
 // ======================================================
 
 static bool probeI2cAddress(uint8_t address) {
-  Wire1.beginTransmission(address);
-  return Wire1.endTransmission() == 0;
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
 }
 
 static void initializeLogDisplay() {
-  Wire1.setSDA(PIN_I2C_SDA);
-  Wire1.setSCL(PIN_I2C_SCL);
-  Wire1.begin();
-  Wire1.setClock(I2C_CLOCK_HZ);
-
-  uint8_t displayAddress = 0;
+  // Arduino-Pico: сначала назначаем выводы I2C0, затем запускаем Wire.
+  Wire.setSDA(PIN_I2C_SDA);
+  Wire.setSCL(PIN_I2C_SCL);
+  Wire.begin();
+  Wire.setClock(I2C_CLOCK_HZ);
 
   if (probeI2cAddress(OLED_ADDRESS_1)) {
-    displayAddress = OLED_ADDRESS_1;
+    oled = &oled3C;
   } else if (probeI2cAddress(OLED_ADDRESS_2)) {
-    displayAddress = OLED_ADDRESS_2;
-  }
-
-  if (displayAddress == 0) {
+    oled = &oled3D;
+  } else {
+    oled = nullptr;
     oledReady = false;
     return;
   }
 
-  // U8g2 принимает 8-битный адрес: 7-битный адрес сдвигается влево.
-  oled.setI2CAddress(static_cast<uint8_t>(displayAddress << 1));
-  oled.setBusClock(I2C_CLOCK_HZ);
-  oled.begin();
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
-  oled.setFontPosTop();
+  // GyverOLED вызывает Wire.begin() внутри init().
+  oled->init();
+  Wire.setClock(I2C_CLOCK_HZ);
+  oled->setScale(1);
+  oled->autoPrintln(false);
 
   oledReady = true;
   oledDirty = true;
   updateLogDisplay();
 }
 
-// ======================================================
 // ОПИСАНИЯ ПРИЧИН ЗАПРЕТА
 // ======================================================
 
@@ -823,7 +825,7 @@ void setup() {
   digitalWrite(PIN_DRIVER_B_H, LOW);
   digitalWrite(PIN_DRIVER_B_L, LOW);
 
-  // I2C1 и OLED. DS1307 в будущем подключится к той же шине.
+  // I2C0 и OLED. DS1307 в будущем подключится к той же шине.
   initializeLogDisplay();
 
   logEvent("BOOT", "ArduinoUPS RP2040 запущен");
