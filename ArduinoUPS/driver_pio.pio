@@ -2,19 +2,16 @@
 ;
 ; GP0=A_H, GP1=A_L, GP2=B_H, GP3=B_L.
 ; GP5 — внутренняя fault-линия от PIO1 drain_monitor.
-; PIO0 использует обязательный side-set шириной 4 бита для атомарной смены
-; всех четырёх управляющих сигналов.
+; Четыре выхода меняются атомарно обязательным side-set шириной 4 бита.
 ;
-; TX FIFO перед запуском получает:
-;   1) activeLoopCount  -> Y;
-;   2) driverLoopCount  -> ISR;
+; TX FIFO:
+;   1) activeLoopCount -> Y;
+;   2) driverLoopCount -> ISR;
 ;   3) interphaseLoopCount -> OSR.
 ;
-; JMP PIN проверяет GP5 в цикле каждого активного импульса A и B.
-; При GP5=1 программа немедленно переходит в emergency:
-; IRQ1 устанавливается одновременно с side-set NORMAL=1010.
-;
-; NORMAL=1010 означает: оба нижних входа драйверов активны, силовые MOSFET закрыты.
+; JMP PIN опрашивает GP5 в активных петлях обоих плеч.
+; При GP5=1 PIO переходит в emergency: NORMAL=1010 + IRQ1.
+; NORMAL=1010 включает нижние входы драйверов и закрывает силовые MOSFET.
 
 .program ups_driver
 .side_set 4
@@ -45,6 +42,8 @@ a_active_check:
 a_turnoff_wait:
     jmp x--, a_turnoff_wait side 0b1000
 
+    ; NOP здесь уравнивает эту паузу с WAIT на wrap-границе после B.
+    nop side 0b1010
     mov x, osr side 0b1010
 a_interphase_wait:
     jmp x--, a_interphase_wait side 0b1010
