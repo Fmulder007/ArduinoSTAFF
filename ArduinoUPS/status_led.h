@@ -4,8 +4,8 @@
   Встроенный WS2812 подключён к GP16. Для него используется PIO1,
   отдельный от PIO0, который формирует сигналы силовых драйверов.
 
-  Функция updateStatusLed() только читает generatorBlockFlags.
-  Она не изменяет блокировки и не управляет генератором.
+  Функция updateStatusLed() читает generatorBlockFlags и generatorIsRunning.
+  Она не изменяет эти флаги и не управляет генератором.
 */
 
 #pragma once
@@ -15,6 +15,7 @@
 #include <hardware/pio.h>
 
 extern volatile uint8_t generatorBlockFlags;
+extern volatile bool generatorIsRunning;
 
 constexpr uint8_t STATUS_LED_PIN = 16;
 constexpr uint32_t STATUS_LED_PIO_FREQUENCY_HZ = 8000000UL;
@@ -35,8 +36,8 @@ static const struct pio_program statusLedWs2812Program = {
 };
 
 enum StatusLedPhase : uint8_t {
-  STATUS_LED_GREEN_ON,
-  STATUS_LED_GREEN_OFF,
+  STATUS_LED_NORMAL_ON,
+  STATUS_LED_NORMAL_OFF,
   STATUS_LED_ERROR_ON,
   STATUS_LED_ERROR_PULSE_GAP,
   STATUS_LED_ERROR_CODE_GAP,
@@ -50,7 +51,8 @@ static bool statusLedReady = false;
 
 static bool statusLedStateInitialized = false;
 static uint8_t statusLedLastFlags = 0;
-static StatusLedPhase statusLedPhase = STATUS_LED_GREEN_ON;
+static bool statusLedLastGeneratorRunning = false;
+static StatusLedPhase statusLedPhase = STATUS_LED_NORMAL_ON;
 static uint32_t statusLedPhaseStartedMs = 0;
 
 static uint8_t statusLedCurrentBit = 0;
@@ -64,6 +66,11 @@ static constexpr uint32_t STATUS_LED_COLOR_GREEN =
     (static_cast<uint32_t>(STATUS_LED_BRIGHTNESS) << 16);
 static constexpr uint32_t STATUS_LED_COLOR_RED =
     (static_cast<uint32_t>(STATUS_LED_BRIGHTNESS) << 8);
+static constexpr uint32_t STATUS_LED_COLOR_YELLOW =
+    (static_cast<uint32_t>(STATUS_LED_BRIGHTNESS) << 16) |
+    (static_cast<uint32_t>(STATUS_LED_BRIGHTNESS) << 8);
+
+static uint32_t statusLedNormalColor = STATUS_LED_COLOR_GREEN;
 
 static uint32_t statusLedLastSentColor = 0;
 static uint32_t statusLedPendingColor = 0;
@@ -117,12 +124,19 @@ static uint8_t statusLedFindNextBit(uint8_t flags, uint8_t firstBit) {
   return 8;
 }
 
-static void statusLedStartPattern(uint8_t flags, uint32_t nowMs) {
+static void statusLedStartPattern(
+    uint8_t flags,
+    bool generatorRunning,
+    uint32_t nowMs) {
+
   statusLedPhaseStartedMs = nowMs;
 
   if (flags == 0) {
-    statusLedPhase = STATUS_LED_GREEN_ON;
-    statusLedRequestColor(STATUS_LED_COLOR_GREEN);
+    statusLedNormalColor = generatorRunning
+        ? STATUS_LED_COLOR_YELLOW
+        : STATUS_LED_COLOR_GREEN;
+    statusLedPhase = STATUS_LED_NORMAL_ON;
+    statusLedRequestColor(statusLedNormalColor);
     return;
   }
 
@@ -209,29 +223,43 @@ static void updateStatusLed() {
 
   const uint32_t nowMs = millis();
   const uint8_t flags = generatorBlockFlags;
+  const bool generatorRunning = generatorIsRunning;
 
-  // Любое изменение маски немедленно перезапускает соответствующий рисунок.
-  if (!statusLedStateInitialized || flags != statusLedLastFlags) {
+  // Красный код зависит только от маски блокировок.
+  // Изменение generatorIsRunning не сбрасывает и не меняет красную последовательность.
+  const bool flagsChanged =
+      !statusLedStateInitialized || flags != statusLedLastFlags;
+  const bool normalStateChanged =
+      statusLedStateInitialized &&
+      flags == 0 &&
+      statusLedLastFlags == 0 &&
+      generatorRunning != statusLedLastGeneratorRunning;
+
+  if (flagsChanged || normalStateChanged) {
     statusLedStateInitialized = true;
     statusLedLastFlags = flags;
-    statusLedStartPattern(flags, nowMs);
+    statusLedLastGeneratorRunning = generatorRunning;
+    statusLedStartPattern(flags, generatorRunning, nowMs);
     statusLedServiceOutput();
     return;
   }
 
+  // Запоминаем состояние и во время красного кода, но не меняем его рисунок.
+  statusLedLastGeneratorRunning = generatorRunning;
+
   switch (statusLedPhase) {
-    case STATUS_LED_GREEN_ON:
+    case STATUS_LED_NORMAL_ON:
       if (static_cast<uint32_t>(nowMs - statusLedPhaseStartedMs) >= 100UL) {
         statusLedRequestColor(STATUS_LED_COLOR_OFF);
-        statusLedPhase = STATUS_LED_GREEN_OFF;
+        statusLedPhase = STATUS_LED_NORMAL_OFF;
         statusLedPhaseStartedMs = nowMs;
       }
       break;
 
-    case STATUS_LED_GREEN_OFF:
+    case STATUS_LED_NORMAL_OFF:
       if (static_cast<uint32_t>(nowMs - statusLedPhaseStartedMs) >= 900UL) {
-        statusLedRequestColor(STATUS_LED_COLOR_GREEN);
-        statusLedPhase = STATUS_LED_GREEN_ON;
+        statusLedRequestColor(statusLedNormalColor);
+        statusLedPhase = STATUS_LED_NORMAL_ON;
         statusLedPhaseStartedMs = nowMs;
       }
       break;
