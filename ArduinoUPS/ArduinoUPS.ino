@@ -398,9 +398,6 @@ static const char *blockReasonText(uint8_t bitMask) {
     case BLOCK_RESERVED_6:
       return "Резервная причина запрета 6";
 
-    case BLOCK_RESERVED_6:
-      return "Резервная причина запрета 6";
-
     case BLOCK_RESERVED_7:
       return "Резервная причина запрета 7";
 
@@ -428,9 +425,6 @@ static const char *blockClearedText(uint8_t bitMask) {
 
     case BLOCK_DRAIN_FAULT:
       return "Блокировка по аварии датчиков стоков снята";
-
-    case BLOCK_RESERVED_6:
-      return "Снята резервная блокировка 6";
 
     case BLOCK_RESERVED_6:
       return "Снята резервная блокировка 6";
@@ -518,13 +512,9 @@ static void logBlockFlagsChanges() {
 // РАСЧЁТ ВРЕМЕННЫХ ИНТЕРВАЛОВ ДЛЯ PIO
 // ======================================================
 
-// Для задержки между двумя SET PINS:
-// SET + MOV X + (X + 1) команд JMP X-- + следующий SET.
-// Поэтому X = длительность_в_тактах - 3.
-//
-// В межполупериодной задержке есть дополнительный NOP.
-// На границе полного периода вместо NOP выполняется WAIT.
-// Эти две инструкции компенсируют друг друга.
+// Все интервалы рассчитываются в целых тактах PIO.
+// Полупериод и четверть периода округляются к ближайшему такту;
+// никаких float/double в расчётах нет.
 static bool calculatePioDelayCounts(
     uint32_t &activeLoopCount,
     uint32_t &driverLoopCount,
@@ -1012,6 +1002,8 @@ void setup() {
   // Вход RUN без внутренней подтяжки — как в исходной версии.
   pinMode(PIN_RUN, INPUT);
 
+  // Датчики стоков — цифровые входы PIO1, GP27 и GP28.
+  // Внешние формирователи должны выдавать определённые уровни 0/1.
   // АЦП RP2040: 12 бит, диапазон 0..4095.
   analogReadResolution(12);
   pinMode(PIN_BATTERY, INPUT);
@@ -1022,10 +1014,12 @@ void setup() {
   pinMode(PIN_DRIVER_B_H, OUTPUT);
   pinMode(PIN_DRIVER_B_L, OUTPUT);
 
+  // До запуска PIO устанавливаем NORMAL=1010: нижние входы драйверов HIGH,
+  // оба силовых MOSFET закрыты и их затворы притянуты к земле.
   digitalWrite(PIN_DRIVER_A_H, LOW);
-  digitalWrite(PIN_DRIVER_A_L, LOW);
+  digitalWrite(PIN_DRIVER_A_L, HIGH);
   digitalWrite(PIN_DRIVER_B_H, LOW);
-  digitalWrite(PIN_DRIVER_B_L, LOW);
+  digitalWrite(PIN_DRIVER_B_L, HIGH);
 
   // I2C0 и OLED. DS1307 в будущем подключится к той же шине.
   initializeLogDisplay();
