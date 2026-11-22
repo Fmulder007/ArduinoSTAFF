@@ -1,77 +1,75 @@
-; ArduinoUPS RP2040-Zero — четыре выхода драйверов.
+; ArduinoUPS RP2040-Zero — четырёхвыходный Push-Pull с аппаратным fault input.
 ;
-; GP0 = A_H, GP1 = A_L, GP2 = B_H, GP3 = B_L.
-; GP4 = физический RUN, обслуживается Arduino loop().
+; GP0=A_H, GP1=A_L, GP2=B_H, GP3=B_L.
+; GP5 — внутренняя fault-линия от PIO1 drain_monitor.
+; PIO0 использует обязательный side-set шириной 4 бита для атомарной смены
+; всех четырёх управляющих сигналов.
 ;
-; Программа занимает все 32 инструкции PIO0 и загружается с offset 0.
-; Начальные значения TX FIFO:
-;   1) длительность активного импульса (Y);
-;   2) защитная пауза драйвера (ISR);
-;   3) межполупериодное ожидание (OSR).
+; TX FIFO перед запуском получает:
+;   1) activeLoopCount  -> Y;
+;   2) driverLoopCount  -> ISR;
+;   3) interphaseLoopCount -> OSR.
 ;
-; SET PINS меняет GP0–GP3 одной командой.
-; WAIT 0 IRQ 0 проверяет STOP только на границе полного периода.
-; IRQ0=1 — остановиться; IRQ0=0 — продолжить.
+; JMP PIN проверяет GP5 в цикле каждого активного импульса A и B.
+; При GP5=1 программа немедленно переходит в emergency:
+; IRQ1 устанавливается одновременно с side-set NORMAL=1010.
 ;
-; Счётчики задержек рассчитываются в ArduinoUPS.ino.
+; NORMAL=1010 означает: оба нижних входа драйверов активны, силовые MOSFET закрыты.
 
 .program ups_driver
+.side_set 4
 
-    pull block
-    mov y, osr
-    pull block
-    mov isr, osr
-    pull block
-
-    ; Исходное состояние: оба нижних плеча включены.
-    set pins, 0b1010
+    pull block side 0b1010
+    mov y, osr side 0b1010
+    pull block side 0b1010
+    mov isr, osr side 0b1010
+    pull block side 0b1010
+    set pins, 0b1010 side 0b1010
 
 .wrap_target
 period_boundary:
-    ; При STOP=1 остаёмся здесь в NORMAL.
-    wait 0 irq 0
+    wait 0 irq 0 side 0b1010
 
     ; Полупериод A.
-    set pins, 0b1000
-    mov x, isr
+    mov x, isr side 0b1000
 a_prepare_wait:
-    jmp x-- a_prepare_wait
+    jmp x--, a_prepare_wait side 0b1000
 
-    set pins, 0b1001
-    mov x, y
-a_active_wait:
-    jmp x-- a_active_wait
+    mov x, y side 0b1001
+    nop side 0b1001
+a_active_check:
+    jmp pin emergency side 0b1001
+    jmp x--, a_active_check side 0b1001
 
-    set pins, 0b1000
-    mov x, isr
+    mov x, isr side 0b1000
 a_turnoff_wait:
-    jmp x-- a_turnoff_wait
+    jmp x--, a_turnoff_wait side 0b1000
 
-    set pins, 0b1010
-    nop
-    mov x, osr
+    mov x, osr side 0b1010
 a_interphase_wait:
-    jmp x-- a_interphase_wait
+    jmp x--, a_interphase_wait side 0b1010
 
     ; Полупериод B.
-    set pins, 0b0010
-    mov x, isr
+    mov x, isr side 0b0010
 b_prepare_wait:
-    jmp x-- b_prepare_wait
+    jmp x--, b_prepare_wait side 0b0010
 
-    set pins, 0b0110
-    mov x, y
-b_active_wait:
-    jmp x-- b_active_wait
+    mov x, y side 0b0110
+    nop side 0b0110
+b_active_check:
+    jmp pin emergency side 0b0110
+    jmp x--, b_active_check side 0b0110
 
-    set pins, 0b0010
-    mov x, isr
+    mov x, isr side 0b0010
 b_turnoff_wait:
-    jmp x-- b_turnoff_wait
+    jmp x--, b_turnoff_wait side 0b0010
 
-    set pins, 0b1010
-    mov x, osr
+    mov x, osr side 0b1010
 b_interphase_wait:
-    jmp x-- b_interphase_wait
-
+    jmp x--, b_interphase_wait side 0b1010
 .wrap
+
+emergency:
+    irq set 1 side 0b1010
+emergency_hold:
+    jmp emergency_hold side 0b1010
