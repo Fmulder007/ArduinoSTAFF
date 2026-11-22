@@ -563,7 +563,7 @@ static bool calculatePioDelayCounts(
 
   if (driverDeadTimeTicks <= 2UL ||
       deadTimeTicks <= (2UL * driverDeadTimeTicks) ||
-      quarterPeriodTicks <= 5UL ||
+      quarterPeriodTicks <= 4UL ||
       activeTicks <= (quarterPeriodTicks + 4UL)) {
     return false;
   }
@@ -571,7 +571,7 @@ static bool calculatePioDelayCounts(
   const uint32_t interphaseTicks =
       deadTimeTicks - (2UL * driverDeadTimeTicks);
 
-  if (interphaseTicks <= 2UL || activeTicks < 4UL) {
+  if (interphaseTicks <= 3UL || activeTicks < 4UL) {
     return false;
   }
 
@@ -582,12 +582,12 @@ static bool calculatePioDelayCounts(
 
   // Каждая пауза: MOV X,reg + N+1 циклов JMP X-- = N+2 тактов.
   driverLoopCount = driverDeadTimeTicks - 2UL;
-  interphaseLoopCount = interphaseTicks - 2UL;
+  interphaseLoopCount = interphaseTicks - 3UL;
 
-  // После обнаружения фронта PIO выполняет WAIT (1 такт), затем:
-  // MOV X,OSR + N+1 JMP X-- + MOV ISR,NULL + IN PINS,2.
-  // Поэтому N = четверть периода - 5 тактов.
-  quarterCheckLoopCount = quarterPeriodTicks - 5UL;
+  // После обнаружения фронта PIO выполняет WAIT (1 такт), затем MOV X,OSR,
+  // N+1 команд JMP X-- и MOV ISR,NULL. На следующем такте выполняется IN PINS,2,
+  // и именно в этот момент считываются датчики. Поэтому N = четверть периода - 4.
+  quarterCheckLoopCount = quarterPeriodTicks - 4UL;
 
   return true;
 }
