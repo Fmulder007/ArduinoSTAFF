@@ -247,6 +247,8 @@ static bool initializeStatusLed() {
 
   uart_set_format(uart0, 8, 1, UART_PARITY_NONE);
   uart_set_fifo_enabled(uart0, true);
+  // Разрешаем аппаратную выдачу DMA-запросов передатчиком UART0.
+  uart_get_hw(uart0)->dmacr |= UART_UARTDMACR_TXDMAE_BITS;
 
   // Сначала удерживаем вывод LOW, затем передаём его UART0.
   // Инверсия превращает UART start/data/stop в импульсы WS2812.
