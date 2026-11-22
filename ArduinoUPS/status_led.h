@@ -133,6 +133,22 @@ static void statusLedStartPattern(uint8_t flags, uint32_t nowMs) {
 }
 
 static bool initializeStatusLed() {
+  // Делитель PIO рассчитывается целочисленно в формате 16.8.
+  const uint64_t divider256 =
+      (static_cast<uint64_t>(clock_get_hz(clk_sys)) * 256ULL +
+       (STATUS_LED_PIO_FREQUENCY_HZ / 2UL)) /
+      STATUS_LED_PIO_FREQUENCY_HZ;
+
+  const uint32_t dividerInteger =
+      static_cast<uint32_t>(divider256 / 256ULL);
+
+  const uint8_t dividerFraction =
+      static_cast<uint8_t>(divider256 % 256ULL);
+
+  if (dividerInteger == 0 || dividerInteger > 65535UL) {
+    return false;
+  }
+
   if (!pio_can_add_program(statusLedPio, &statusLedWs2812Program)) {
     return false;
   }
@@ -165,11 +181,10 @@ static bool initializeStatusLed() {
   sm_config_set_out_shift(&config, false, true, 24);
   sm_config_set_fifo_join(&config, PIO_FIFO_JOIN_TX);
 
-  const float clockDivider =
-      static_cast<float>(clock_get_hz(clk_sys)) /
-      static_cast<float>(STATUS_LED_PIO_FREQUENCY_HZ);
-
-  sm_config_set_clkdiv(&config, clockDivider);
+  sm_config_set_clkdiv_int_frac8(
+      &config,
+      static_cast<uint16_t>(dividerInteger),
+      dividerFraction);
 
   pio_sm_init(
       statusLedPio,
