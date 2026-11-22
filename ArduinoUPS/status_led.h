@@ -67,8 +67,7 @@ static constexpr uint32_t STATUS_LED_COLOR_GREEN =
 static constexpr uint32_t STATUS_LED_COLOR_RED =
     (static_cast<uint32_t>(STATUS_LED_BRIGHTNESS) << 8);
 static constexpr uint32_t STATUS_LED_COLOR_YELLOW =
-    (static_cast<uint32_t>(STATUS_LED_BRIGHTNESS) << 16) |
-    (static_cast<uint32_t>(STATUS_LED_BRIGHTNESS) << 8);
+    (20UL << 16) | (32UL << 8);
 
 static uint32_t statusLedNormalColor = STATUS_LED_COLOR_GREEN;
 
