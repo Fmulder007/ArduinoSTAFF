@@ -1,0 +1,77 @@
+; ArduinoUPS RP2040-Zero — четыре выхода драйверов.
+;
+; GP0 = A_H, GP1 = A_L, GP2 = B_H, GP3 = B_L.
+; GP4 = физический RUN, обслуживается Arduino loop().
+;
+; Программа занимает все 32 инструкции PIO0 и загружается с offset 0.
+; Начальные значения TX FIFO:
+;   1) длительность активного импульса (Y);
+;   2) защитная пауза драйвера (ISR);
+;   3) межполупериодное ожидание (OSR).
+;
+; SET PINS меняет GP0–GP3 одной командой.
+; WAIT 0 IRQ 0 проверяет STOP только на границе полного периода.
+; IRQ0=1 — остановиться; IRQ0=0 — продолжить.
+;
+; Счётчики задержек рассчитываются в ArduinoUPS.ino.
+
+.program ups_driver
+
+    pull block
+    mov y, osr
+    pull block
+    mov isr, osr
+    pull block
+
+    ; Исходное состояние: оба нижних плеча включены.
+    set pins, 0b1010
+
+.wrap_target
+period_boundary:
+    ; При STOP=1 остаёмся здесь в NORMAL.
+    wait 0 irq 0
+
+    ; Полупериод A.
+    set pins, 0b1000
+    mov x, isr
+a_prepare_wait:
+    jmp x-- a_prepare_wait
+
+    set pins, 0b1001
+    mov x, y
+a_active_wait:
+    jmp x-- a_active_wait
+
+    set pins, 0b1000
+    mov x, isr
+a_turnoff_wait:
+    jmp x-- a_turnoff_wait
+
+    set pins, 0b1010
+    nop
+    mov x, osr
+a_interphase_wait:
+    jmp x-- a_interphase_wait
+
+    ; Полупериод B.
+    set pins, 0b0010
+    mov x, isr
+b_prepare_wait:
+    jmp x-- b_prepare_wait
+
+    set pins, 0b0110
+    mov x, y
+b_active_wait:
+    jmp x-- b_active_wait
+
+    set pins, 0b0010
+    mov x, isr
+b_turnoff_wait:
+    jmp x-- b_turnoff_wait
+
+    set pins, 0b1010
+    mov x, osr
+b_interphase_wait:
+    jmp x-- b_interphase_wait
+
+.wrap
