@@ -1,293 +1,311 @@
 /*
-  ArduinoUPS — испытательный генератор и контроль АКБ
-  Плата: Arduino Nano, ATmega328P, 16 МГц.
+  ArduinoUPS — RP2040-Zero, четырёхвыходной PIO-генератор.
 
-  RUN:
-    A0 / PC0 — HIGH: генерация запрошена, LOW: сеть появилась.
-    Физический вход RUN читает только updateRunStatus().
+  Перенос ветки arduino-ups-four-output-driver:
+    GP0 — DRIVER_A_H: верхнее плечо драйвера A.
+    GP1 — DRIVER_A_L: нижнее плечо драйвера A.
+    GP2 — DRIVER_B_H: верхнее плечо драйвера B.
+    GP3 — DRIVER_B_L: нижнее плечо драйвера B.
+    GP4 — RUN: HIGH = генерация нужна, LOW = сеть появилась.
 
-  Управление двумя драйверами — четыре выхода одного порта PORTD:
-    D4 / PD4 — DRIVER_A_H: верхнее плечо канала A.
-    D5 / PD5 — DRIVER_A_L: нижнее плечо канала A.
-    D6 / PD6 — DRIVER_B_H: верхнее плечо канала B.
-    D7 / PD7 — DRIVER_B_L: нижнее плечо канала B.
+  Пока перенесены только четыре выхода и RUN. АКБ, реле, дисплей,
+  энкодер и остальные функции намеренно не включены.
 
-  Кнопку энкодера переносим с D4 на A2, чтобы освободить PD4.
-  D2/D3 остаются каналами энкодера A/B.
-  D8 / PB0 — CHARGE_RELAY, пока всегда LOW.
-  A6 / ADC6 — измерение напряжения аккумулятора.
-
-  Для каждого управляющего входа 2N7002 обязательна внешняя подтяжка
-  затвор–GND 10 кОм. На каждом IRFZ44N также нужен отдельный резистор
-  затвор–исток, чтобы силовой MOSFET оставался закрытым при Hi-Z/RESET.
-
-  У верхнего BSS84 обязателен резистор затвор–исток к его источнику +8 В:
-  он гарантирует закрытие BSS84, когда управляющий 2N7002 выключен.
-  На каждом IRFZ44N также нужен отдельный резистор затвор–исток, чтобы
-  силовой MOSFET оставался закрытым при Hi-Z/RESET.
-
-  Важно: код управляет только логическими входами драйверов. До подключения
-  силовой части проверить все четыре сигнала и их защитные интервалы
-  осциллографом на низковольтном макете.
+  Все четыре выхода управляются одной инструкцией SET PINS автомата PIO.
+  CPU не обслуживает отдельные фронты и не участвует в формировании
+  временных интервалов.
 */
 
-// ======================================================
-// ПОЛЬЗОВАТЕЛЬСКИЕ НАСТРОЙКИ
-// ======================================================
-
-// Настройки генератора
-#define UPS_FREQUENCY_HZ                    50  // Частота выходного сигнала, Гц
-#define UPS_DEADTIME_PERCENT                10  // Общее межполупериодное окно, % от полупериода
-#define UPS_DRIVER_DEADTIME_US              50UL // Пауза между плечами одного драйвера, мкс; начальное значение для проверки
-#define UPS_STARTUP_DELAY_MS              1000  // Пауза после включения МК, мс
-#define UPS_RUN_OFF_DELAY_MS              5000  // Время устойчивого RUN=LOW до подтверждения сети, мс
-#define UPS_TIMER_STALL_TIMEOUT_MS          100  // Тайм-аут контроля продвижения автомата, мс
-
-// Настройки измерения аккумулятора
-#define BATTERY_MEASURE_INTERVAL_MS       1000  // Период измерения напряжения АКБ, мс
-#define BATTERY_ADC_SAMPLES                 16  // Количество измерений АЦП для усреднения
-#define BATTERY_ADC_REFERENCE_MV          1100UL // Опорное напряжение INTERNAL, мВ; уточнить калибровкой
-#define BATTERY_DIVIDER_TOP_OHM         330000UL // Верхний резистор делителя: АКБ+ -> A6, Ом
-#define BATTERY_DIVIDER_BOTTOM_OHM       10000UL // Нижний резистор делителя: A6 -> GND, Ом
-
-// Пороговые напряжения АКБ — позднее будут настраиваться из меню
-#define BATTERY_GENERATOR_STOP_CV             0 // Запрет генерации ниже этого напряжения, сотые В; 0 = отсечка отключена
-#define BATTERY_GENERATOR_RECOVERY_CV         0 // Снятие запрета выше этого напряжения, сотые В; 0 = отсечка отключена
-#define BATTERY_CHARGE_ON_CV                  0 // Включить заряд ниже этого напряжения, сотые В; пока не используется
-#define BATTERY_CHARGE_OFF_CV                 0 // Выключить заряд выше этого напряжения, сотые В; пока не используется
-
-// Коды причин запрета генерации. Каждому модулю принадлежит свой бит.
-#define BLOCK_BATTERY_LOW                   0x01 // Бит 0: низкое напряжение аккумулятора
-#define BLOCK_OVERHEAT                      0x02 // Бит 1: перегрев
-#define BLOCK_OVERLOAD                      0x04 // Бит 2: перегрузка
-#define BLOCK_MAINS_FAULT                   0x08 // Бит 3: неисправность/недопустимое состояние сети
-#define BLOCK_SENSOR_FAULT                  0x10 // Бит 4: неисправность датчика
-#define BLOCK_RESERVED_5                   0x20 // Бит 5: резерв
-#define BLOCK_RESERVED_6                   0x40 // Бит 6: резерв
-#define BLOCK_RESERVED_7                   0x80 // Бит 7: резерв
-
 #include <Arduino.h>
-#include <avr/io.h>
-#include <avr/interrupt.h>
-#include <avr/pgmspace.h>
+#include <hardware/clocks.h>
+#include <hardware/pio.h>
+
+#include "driver_pio.h"
 
 // ======================================================
-// ПИНЫ И ТАБЛИЦА ВЫХОДНЫХ СОСТОЯНИЙ
+// ВЫВОДЫ RP2040-ZERO
 // ======================================================
 
-#define RUN_MASK          _BV(PC0)  // A0: вход датчика сети / RUN
-#define BATTERY_PIN       A6        // A6: аналоговый вход измерения АКБ
-#define CHARGE_RELAY_MASK _BV(PB0)  // D8: выход управления реле зарядки
+// Четыре последовательных GPIO управляются одной SET PINS командой PIO.
+constexpr uint8_t PIN_DRIVER_A_H = 0;  // GP0
+constexpr uint8_t PIN_DRIVER_A_L = 1;  // GP1
+constexpr uint8_t PIN_DRIVER_B_H = 2;  // GP2
+constexpr uint8_t PIN_DRIVER_B_L = 3;  // GP3
 
-// Все четыре управляющих выхода находятся на PD4–PD7.
-// PD0–PD3 сохраняются при каждой записи в PORTD.
-#define DRIVER_OUTPUT_MASK 0xF0
-#define DRIVER_A_H_MASK    _BV(PD4)
-#define DRIVER_A_L_MASK    _BV(PD5)
-#define DRIVER_B_H_MASK    _BV(PD6)
-#define DRIVER_B_L_MASK    _BV(PD7)
-#define DRIVER_A_MASK      (DRIVER_A_H_MASK | DRIVER_A_L_MASK)
-#define DRIVER_B_MASK      (DRIVER_B_H_MASK | DRIVER_B_L_MASK)
+// Единственный физический вход этой испытательной версии.
+constexpr uint8_t PIN_RUN = 4;         // GP4
 
-// Значения именно старшей тетрады PORTD (PD7..PD4).
-// Нормальное состояние: A_L и B_L включены, A_H и B_H выключены.
-#define PATTERN_NORMAL_VALUE       0xA0
-#define PATTERN_A_PREPARE_VALUE    0x80
-#define PATTERN_A_ACTIVE_VALUE     0x90
-#define PATTERN_B_PREPARE_VALUE    0x20
-#define PATTERN_B_ACTIVE_VALUE     0x60
-#define PATTERN_ALL_OFF_VALUE      0x00
+// ======================================================
+// ПАРАМЕТРЫ ГЕНЕРАТОРА
+// ======================================================
 
-// Проверка таблицы на невозможность включить оба плеча одного драйвера.
+#define UPS_FREQUENCY_HZ                 50UL
+#define UPS_DEADTIME_PERCENT              10UL
+#define UPS_DRIVER_DEADTIME_US            50UL
+#define UPS_STARTUP_DELAY_MS            1000UL
+#define UPS_RUN_OFF_DELAY_MS            5000UL
+
+// PIO работает на 2,5 МГц: один цикл = 0,4 мкс.
+// При штатной частоте clk_sys = 125 МГц делитель равен ровно 50,
+// то есть дробный делитель и его фазовая модуляция не используются.
+constexpr uint32_t PIO_CLOCK_HZ = 2500000UL;
+
+// PIO IRQ0 используется как внутренний флаг STOP.
+// IRQ0 = 1: остановить на ближайшей границе полного периода.
+// IRQ0 = 0: разрешить следующий полный период.
+constexpr uint8_t PIO_IRQ_STOP_REQUEST = 0;
+
+// Порядок битов SET PINS: GP3 GP2 GP1 GP0 = B_L B_H A_L A_H.
+constexpr uint8_t PATTERN_NORMAL       = 0b1010; // A_L + B_L
+constexpr uint8_t PATTERN_A_PREPARE    = 0b1000; // B_L
+constexpr uint8_t PATTERN_A_ACTIVE     = 0b1001; // B_L + A_H
+constexpr uint8_t PATTERN_B_PREPARE    = 0b0010; // A_L
+constexpr uint8_t PATTERN_B_ACTIVE     = 0b0110; // A_L + B_H
+constexpr uint8_t PATTERN_ALL_OFF      = 0b0000;
+
+// Compile-time проверка: верхнее и нижнее плечи одного драйвера
+// ни в одном используемом шаблоне не включаются одновременно.
+constexpr uint8_t DRIVER_A_MASK = 0b0011;
+constexpr uint8_t DRIVER_B_MASK = 0b1100;
+
 #define DRIVER_PATTERN_SAFE(value) \
   ((((value) & DRIVER_A_MASK) != DRIVER_A_MASK) && \
    (((value) & DRIVER_B_MASK) != DRIVER_B_MASK))
 
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_NORMAL_VALUE), "Unsafe normal driver pattern");
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_A_PREPARE_VALUE), "Unsafe A prepare pattern");
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_A_ACTIVE_VALUE), "Unsafe A active pattern");
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_B_PREPARE_VALUE), "Unsafe B prepare pattern");
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_B_ACTIVE_VALUE), "Unsafe B active pattern");
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_ALL_OFF_VALUE), "Unsafe all-off pattern");
+static_assert(DRIVER_PATTERN_SAFE(PATTERN_NORMAL), "Unsafe NORMAL pattern");
+static_assert(DRIVER_PATTERN_SAFE(PATTERN_A_PREPARE), "Unsafe A_PREPARE pattern");
+static_assert(DRIVER_PATTERN_SAFE(PATTERN_A_ACTIVE), "Unsafe A_ACTIVE pattern");
+static_assert(DRIVER_PATTERN_SAFE(PATTERN_B_PREPARE), "Unsafe B_PREPARE pattern");
+static_assert(DRIVER_PATTERN_SAFE(PATTERN_B_ACTIVE), "Unsafe B_ACTIVE pattern");
+static_assert(DRIVER_PATTERN_SAFE(PATTERN_ALL_OFF), "Unsafe ALL_OFF pattern");
 
-enum DriverPattern : uint8_t {
-  DRIVER_PATTERN_NORMAL,
-  DRIVER_PATTERN_A_PREPARE,
-  DRIVER_PATTERN_A_ACTIVE,
-  DRIVER_PATTERN_B_PREPARE,
-  DRIVER_PATTERN_B_ACTIVE,
-  DRIVER_PATTERN_ALL_OFF
-};
+// ======================================================
+// СОСТОЯНИЕ RUN
+// ======================================================
 
-// Таблица хранится во Flash. Каждая запись — один байт для PORTD.
-const uint8_t driverPortPatterns[] PROGMEM = {
-  PATTERN_NORMAL_VALUE,       // 0: 1010 — A_L + B_L, нормальное состояние
-  PATTERN_A_PREPARE_VALUE,    // 1: 1000 — A_L выключено, B_L включено
-  PATTERN_A_ACTIVE_VALUE,     // 2: 1001 — A_H + B_L
-  PATTERN_B_PREPARE_VALUE,    // 3: 0010 — A_L включено, B_L выключено
-  PATTERN_B_ACTIVE_VALUE,     // 4: 0110 — A_L + B_H
-  PATTERN_ALL_OFF_VALUE       // 5: 0000 — все управляющие 2N7002 выключены
-};
+// Поведение перенесено из updateRunStatus() исходной четырёхвыходной ветки.
+bool runLowTiming = false;
+bool mainsPresentConfirmed = false;
+bool generatorRunRequest = false;
+uint32_t runLowSince = 0;
 
-static inline void writeDriverPattern(DriverPattern pattern) {
-  const uint8_t value =
-      pgm_read_byte(&driverPortPatterns[static_cast<uint8_t>(pattern)]);
+// Состояние внутреннего разрешения PIO, последнее переданное из loop().
+bool pioRunPermissionApplied = false;
 
-  // Одной записью меняем PD4–PD7; PD0–PD3 не затрагиваем.
-  PORTD = static_cast<uint8_t>(
-      (PORTD & static_cast<uint8_t>(~DRIVER_OUTPUT_MASK)) |
-      (value & DRIVER_OUTPUT_MASK));
+// ======================================================
+// БЕЗОПАСНОЕ СОСТОЯНИЕ ПРИ ОШИБКЕ ИНИЦИАЛИЗАЦИИ
+// ======================================================
+
+static void holdAllDriverOutputsLow() {
+  const uint8_t pins[] = {
+    PIN_DRIVER_A_H,
+    PIN_DRIVER_A_L,
+    PIN_DRIVER_B_H,
+    PIN_DRIVER_B_L
+  };
+
+  for (uint8_t i = 0; i < sizeof(pins); ++i) {
+    gpio_set_function(pins[i], GPIO_FUNC_SIO);
+    gpio_set_dir(pins[i], GPIO_OUT);
+    gpio_put(pins[i], false);
+  }
+
+  while (true) {
+    // Ошибка конфигурации: не запускать силовые ключи.
+  }
 }
 
 // ======================================================
-// ВРЕМЕННЫЕ ПАРАМЕТРЫ И СОСТОЯНИЯ АВТОМАТА
+// РАСЧЁТ ВРЕМЕННЫХ ИНТЕРВАЛОВ ДЛЯ PIO
 // ======================================================
 
-// Timer1: Normal mode, предделитель 8.
-// При F_CPU=16 МГц частота таймера 2 МГц, один тик = 0,5 мкс.
-volatile uint16_t activeTicks = 0;
-volatile uint16_t driverDeadTimeTicks = 0;
-volatile uint16_t interphaseWaitTicks = 0;
-volatile uint16_t periodTicks = 0;
+// Параметры передаются в PIO как значения счётчика X.
+//
+// Обычная задержка между двумя SET PINS:
+//   SET PINS + MOV X, регистр + (X + 1) инструкций JMP X--
+// Поэтому X = длительность_в_тактах - 3.
+//
+// Межполупериодная задержка использует дополнительный NOP в первой
+// половине и WAIT 0 IRQ на границе периода во второй. Эти две инструкции
+// компенсируют друг друга, поэтому обе межполупериодные паузы остаются
+// одинаковыми и полный период составляет ровно 20 мс.
+static bool calculatePioDelayCounts(
+    uint32_t &activeLoopCount,
+    uint32_t &driverLoopCount,
+    uint32_t &interphaseLoopCount) {
 
-bool generatorTimingValid = false;
-volatile bool generatorRunning = false;
-
-// Общий байт причин запрета: 0 — запретов нет, ненулевое значение запрещает
-// запуск следующего периода. Каждый модуль меняет только собственный бит.
-volatile uint8_t generatorBlockFlags = 0;
-
-// RUN читает только updateRunStatus().
-// generatorRunRequest — текущий RUN=HIGH.
-// mainsPresentConfirmed — RUN=LOW непрерывно 5 секунд.
-volatile bool generatorRunRequest = false;
-volatile bool mainsPresentConfirmed = false;
-bool runLowTiming = false;
-uint32_t runLowSince = 0;
-
-// Контроль того, что Timer1 продолжает выдавать события.
-volatile uint8_t timer1Heartbeat = 0;
-uint8_t lastTimer1Heartbeat = 0;
-uint32_t lastTimer1HeartbeatMs = 0;
-
-// Последнее измеренное напряжение аккумулятора и время последнего измерения.
-uint16_t batteryVoltageCentiV = 0; // 1234 = 12,34 В
-uint32_t lastBatteryMeasureMs = 0;
-
-enum GeneratorPhase : uint8_t {
-  GEN_PERIOD_BOUNDARY,       // Единственное место проверки разрешения периода
-  GEN_WAIT_A_ON,             // Ожидание защитного интервала перед верхним A
-  GEN_A_ACTIVE,              // Импульс верхнего плеча A завершится по таймеру
-  GEN_WAIT_A_LOWER,          // Ожидание перед возвратом A в нормальное состояние
-  GEN_WAIT_B_LOWER_OFF,      // Ожидание границы начала полупериода B
-  GEN_WAIT_B_ON,             // Ожидание защитного интервала перед верхним B
-  GEN_B_ACTIVE,              // Импульс верхнего плеча B завершится по таймеру
-  GEN_WAIT_B_LOWER,          // Ожидание перед возвратом B в нормальное состояние
-  GEN_FAULT_RECOVERY         // Возврат из ошибочного состояния в нормальное
-};
-
-volatile GeneratorPhase generatorPhase = GEN_PERIOD_BOUNDARY;
-
-// ======================================================
-// ЕДИНЫЙ МЕХАНИЗМ УПРАВЛЕНИЯ ЧЕТЫРЬМЯ ВЫХОДАМИ
-// ======================================================
-
-// Эта функция вызывается только из ISR Timer1.
-// Проверка generatorBlockFlags и RUN-переменных выполняется только
-// в GEN_PERIOD_BOUNDARY — один раз на границе полного периода 20 мс.
-static void driverControlStep() {
-  switch (generatorPhase) {
-    case GEN_PERIOD_BOUNDARY: {
-      const bool previousPeriodMayContinue =
-          generatorRunning && !mainsPresentConfirmed;
-      const bool newPeriodRequested = generatorRunRequest;
-
-      if (generatorBlockFlags == 0 &&
-          (newPeriodRequested || previousPeriodMayContinue)) {
-        generatorRunning = true;
-
-        // Из нормального состояния выключаем только нижнее плечо A.
-        writeDriverPattern(DRIVER_PATTERN_A_PREPARE);
-        OCR1A += driverDeadTimeTicks;
-        generatorPhase = GEN_WAIT_A_ON;
-      } else {
-        // Остаёмся в нормальном состоянии и проверяем снова через 20 мс.
-        generatorRunning = false;
-        writeDriverPattern(DRIVER_PATTERN_NORMAL);
-        OCR1A += periodTicks;
-      }
-      break;
-    }
-
-    case GEN_WAIT_A_ON:
-      // Защитная пауза A завершена: включаем верхнее плечо A.
-      writeDriverPattern(DRIVER_PATTERN_A_ACTIVE);
-      OCR1A += activeTicks;
-      generatorPhase = GEN_A_ACTIVE;
-      break;
-
-    case GEN_A_ACTIVE:
-      // Импульс A закончен: выключаем верхнее A.
-      // Нижнее A пока остаётся выключенным.
-      writeDriverPattern(DRIVER_PATTERN_A_PREPARE);
-      OCR1A += driverDeadTimeTicks;
-      generatorPhase = GEN_WAIT_A_LOWER;
-      break;
-
-    case GEN_WAIT_A_LOWER:
-      // Защитная пауза завершена: возвращаем A в нормальное состояние.
-      writeDriverPattern(DRIVER_PATTERN_NORMAL);
-      OCR1A += interphaseWaitTicks;
-      generatorPhase = GEN_WAIT_B_LOWER_OFF;
-      break;
-
-    case GEN_WAIT_B_LOWER_OFF:
-      // Начало второй половины: выключаем только нижнее плечо B.
-      writeDriverPattern(DRIVER_PATTERN_B_PREPARE);
-      OCR1A += driverDeadTimeTicks;
-      generatorPhase = GEN_WAIT_B_ON;
-      break;
-
-    case GEN_WAIT_B_ON:
-      // Защитная пауза B завершена: включаем верхнее плечо B.
-      writeDriverPattern(DRIVER_PATTERN_B_ACTIVE);
-      OCR1A += activeTicks;
-      generatorPhase = GEN_B_ACTIVE;
-      break;
-
-    case GEN_B_ACTIVE:
-      // Импульс B закончен: выключаем верхнее B.
-      writeDriverPattern(DRIVER_PATTERN_B_PREPARE);
-      OCR1A += driverDeadTimeTicks;
-      generatorPhase = GEN_WAIT_B_LOWER;
-      break;
-
-    case GEN_WAIT_B_LOWER:
-      // Защитная пауза завершена: оба драйвера снова в нормальном состоянии.
-      writeDriverPattern(DRIVER_PATTERN_NORMAL);
-      OCR1A += interphaseWaitTicks;
-      generatorPhase = GEN_PERIOD_BOUNDARY;
-      break;
-
-    case GEN_FAULT_RECOVERY:
-      // Ошибка состояния: все управляющие 2N7002 были выключены.
-      // После паузы возвращаем нижние плечи и ждём следующую границу периода.
-      writeDriverPattern(DRIVER_PATTERN_NORMAL);
-      generatorRunning = false;
-      OCR1A += periodTicks;
-      generatorPhase = GEN_PERIOD_BOUNDARY;
-      break;
-
-    default:
-      // Неизвестное состояние: не продолжаем генерацию.
-      // Сначала выключаем все четыре малых ключа, затем вернём нормальное
-      // состояние через защитную паузу отдельным событием Timer1.
-      writeDriverPattern(DRIVER_PATTERN_ALL_OFF);
-      generatorRunning = false;
-      OCR1A += driverDeadTimeTicks;
-      generatorPhase = GEN_FAULT_RECOVERY;
-      break;
+  if (UPS_FREQUENCY_HZ == 0 ||
+      UPS_DEADTIME_PERCENT == 0 ||
+      UPS_DEADTIME_PERCENT >= 100 ||
+      UPS_DRIVER_DEADTIME_US == 0) {
+    return false;
   }
+
+  const uint32_t halfPeriodDenominator = 2UL * UPS_FREQUENCY_HZ;
+
+  if ((PIO_CLOCK_HZ % halfPeriodDenominator) != 0) {
+    return false;
+  }
+
+  const uint32_t halfPeriodTicks =
+      PIO_CLOCK_HZ / halfPeriodDenominator;
+
+  const uint32_t deadTimeTicks =
+      (halfPeriodTicks * UPS_DEADTIME_PERCENT) / 100UL;
+
+  const uint32_t activeTicks =
+      halfPeriodTicks - deadTimeTicks;
+
+  // Округление вверх — защитная пауза не может быть короче заданной.
+  const uint64_t driverTicksNumerator =
+      static_cast<uint64_t>(PIO_CLOCK_HZ) * UPS_DRIVER_DEADTIME_US;
+
+  const uint32_t driverDeadTimeTicks =
+      static_cast<uint32_t>(
+          (driverTicksNumerator + 999999ULL) / 1000000ULL);
+
+  // В общем dead time две защитные паузы драйверов,
+  // остаток — межполупериодное ожидание.
+  if (deadTimeTicks <= (2UL * driverDeadTimeTicks)) {
+    return false;
+  }
+
+  const uint32_t interphaseTicks =
+      deadTimeTicks - (2UL * driverDeadTimeTicks);
+
+  // Проверяем минимальные значения, необходимые для счётных циклов PIO.
+  if (activeTicks <= 3UL ||
+      driverDeadTimeTicks <= 3UL ||
+      interphaseTicks <= 4UL) {
+    return false;
+  }
+
+  activeLoopCount = activeTicks - 3UL;
+  driverLoopCount = driverDeadTimeTicks - 3UL;
+  interphaseLoopCount = interphaseTicks - 4UL;
+
+  return true;
+}
+
+// ======================================================
+// ИНИЦИАЛИЗАЦИЯ PIO-ГЕНЕРАТОРА
+// ======================================================
+
+static bool initializePioGenerator() {
+  // PIO-программа занимает всю память инструкций PIO0 (32 слова)
+  // и загружается с фиксированного адреса 0, на который рассчитаны JMP.
+  if (!pio_can_add_program_at_offset(
+          pio0, &ups_driver_program, 0)) {
+    return false;
+  }
+
+  const uint32_t systemClockHz = clock_get_hz(clk_sys);
+
+  // Требуем целый делитель. Для штатных 125 МГц это ровно 50,
+  // следовательно PIO получает стабильные 2,5 МГц без дробного деления.
+  if ((systemClockHz % PIO_CLOCK_HZ) != 0) {
+    return false;
+  }
+
+  const uint32_t clockDivider = systemClockHz / PIO_CLOCK_HZ;
+
+  if (clockDivider == 0 || clockDivider > 65535UL) {
+    return false;
+  }
+
+  uint32_t activeLoopCount = 0;
+  uint32_t driverLoopCount = 0;
+  uint32_t interphaseLoopCount = 0;
+
+  if (!calculatePioDelayCounts(
+          activeLoopCount,
+          driverLoopCount,
+          interphaseLoopCount)) {
+    return false;
+  }
+
+  const int sm = pio_claim_unused_sm(pio0, false);
+  if (sm < 0) {
+    return false;
+  }
+
+  const int programOffset =
+      pio_add_program_at_offset(pio0, &ups_driver_program, 0);
+
+  if (programOffset != 0) {
+    return false;
+  }
+
+  pio_sm_config config = pio_get_default_sm_config();
+
+  // SET PINS управляет GP0–GP3 одной четырёхбитной командой.
+  sm_config_set_set_pins(
+      &config,
+      PIN_DRIVER_A_H,
+      4);
+
+  sm_config_set_wrap(
+      &config,
+      UPS_DRIVER_PIO_WRAP_TARGET,
+      UPS_DRIVER_PIO_WRAP);
+
+  // Только целый делитель частоты PIO.
+  sm_config_set_clkdiv_int_frac8(
+      &config,
+      clockDivider,
+      0);
+
+  pio_sm_init(pio0, static_cast<uint>(sm), 0, &config);
+
+  for (uint8_t pin = PIN_DRIVER_A_H; pin <= PIN_DRIVER_B_L; ++pin) {
+    pio_gpio_init(pio0, pin);
+  }
+
+  if (pio_sm_set_consecutive_pindirs(
+          pio0,
+          static_cast<uint>(sm),
+          PIN_DRIVER_A_H,
+          4,
+          true) != 0) {
+    return false;
+  }
+
+  // До запуска программы сразу устанавливаем безопасное нормальное
+  // состояние: оба нижних плеча включены, оба верхних выключены.
+  pio_sm_set_pins_with_mask(
+      pio0,
+      static_cast<uint>(sm),
+      PATTERN_NORMAL,
+      0x0F);
+
+  // PIO-программа загружает эти три значения в Y, ISR и OSR:
+  // Y   — длительность активного импульса 9 мс;
+  // ISR — защитная пауза драйвера 50 мкс;
+  // OSR — межполупериодное ожидание 900 мкс.
+  pio_sm_put_blocking(
+      pio0,
+      static_cast<uint>(sm),
+      activeLoopCount);
+
+  pio_sm_put_blocking(
+      pio0,
+      static_cast<uint>(sm),
+      driverLoopCount);
+
+  pio_sm_put_blocking(
+      pio0,
+      static_cast<uint>(sm),
+      interphaseLoopCount);
+
+  // Сначала устанавливаем STOP, чтобы PIO остался в NORMAL
+  // и не начал генерацию до подтверждения RUN.
+  pio_interrupt_clear(pio0, PIO_IRQ_STOP_REQUEST);
+  pio0->irq_force = (1u << PIO_IRQ_STOP_REQUEST);
+  pioRunPermissionApplied = false;
+
+  pio_sm_set_enabled(pio0, static_cast<uint>(sm), true);
+
+  return true;
 }
 
 // ======================================================
@@ -295,8 +313,8 @@ static void driverControlStep() {
 // ======================================================
 
 void updateRunStatus(uint32_t now) {
-  // Только эта функция читает физический вход A0/RUN.
-  const bool runIsHigh = (PINC & RUN_MASK) != 0;
+  // Только эта функция читает физический вход RUN.
+  const bool runIsHigh = (digitalRead(PIN_RUN) == HIGH);
   bool runLowConfirmed = false;
 
   if (runIsHigh) {
@@ -308,10 +326,6 @@ void updateRunStatus(uint32_t now) {
     runLowConfirmed = true;
   }
 
-  // Два флага, которые читает ISR, обновляем атомарно.
-  const uint8_t savedSREG = SREG;
-  cli();
-
   if (runIsHigh) {
     mainsPresentConfirmed = false;
     generatorRunRequest = true;
@@ -319,262 +333,68 @@ void updateRunStatus(uint32_t now) {
     mainsPresentConfirmed = true;
     generatorRunRequest = false;
   }
-
-  SREG = savedSREG;
 }
 
 // ======================================================
-// КОНТРОЛЬ ЗАВИСАНИЯ TIMER1
+// ПЕРЕДАЧА РАЗРЕШЕНИЯ ГЕНЕРАТОРУ PIO
 // ======================================================
 
-// Если Timer1 перестал выдавать события, loop() отключает все четыре
-// управляющих сигнала. Через защитный интервал Timer1 возвращает нормальное
-// состояние. Это программный резерв на случай остановки самого таймера.
-void superviseTimer(uint32_t now) {
-  if (!generatorTimingValid) {
+// PIO проверяет флаг только на границе полного периода.
+// IRQ0 = 0 — следующий период разрешён.
+// IRQ0 = 1 — текущий период завершается, затем PIO остаётся в NORMAL.
+//
+// WAIT 0 IRQ не очищает флаг при выполнении условия. Это позволяет
+// использовать IRQ0 как устойчивый уровень разрешения/запрета.
+static void applyGeneratorRunRequest() {
+  if (generatorRunRequest == pioRunPermissionApplied) {
     return;
   }
 
-  const uint8_t currentHeartbeat = timer1Heartbeat;
-
-  if (currentHeartbeat != lastTimer1Heartbeat) {
-    lastTimer1Heartbeat = currentHeartbeat;
-    lastTimer1HeartbeatMs = now;
-    return;
+  if (generatorRunRequest) {
+    // Снять STOP: PIO сможет начать следующий период.
+    pio_interrupt_clear(pio0, PIO_IRQ_STOP_REQUEST);
+  } else {
+    // Установить STOP: PIO остановится только после полного периода A+B.
+    pio0->irq_force = (1u << PIO_IRQ_STOP_REQUEST);
   }
 
-  if (now - lastTimer1HeartbeatMs <= UPS_TIMER_STALL_TIMEOUT_MS) {
-    return;
-  }
-
-  const uint8_t savedSREG = SREG;
-  cli();
-
-  TCCR1B = 0;
-  TIMSK1 = 0;
-
-  writeDriverPattern(DRIVER_PATTERN_ALL_OFF);
-  generatorRunning = false;
-  generatorPhase = GEN_FAULT_RECOVERY;
-
-  TCNT1 = 0;
-  OCR1A = driverDeadTimeTicks;
-  TIFR1 = _BV(OCF1A) | _BV(TOV1);
-  TIMSK1 = _BV(OCIE1A);
-  TCCR1B = _BV(CS11);
-
-  lastTimer1Heartbeat = timer1Heartbeat;
-  lastTimer1HeartbeatMs = now;
-
-  SREG = savedSREG;
+  pioRunPermissionApplied = generatorRunRequest;
 }
 
 // ======================================================
-// ИЗМЕРЕНИЕ НАПРЯЖЕНИЯ АККУМУЛЯТОРА
-// ======================================================
-
-void measureBatteryVoltage() {
-  uint32_t adcSum = 0;
-
-  // Усредняем несколько измерений ADC6.
-  for (uint8_t i = 0; i < BATTERY_ADC_SAMPLES; i++) {
-    adcSum += analogRead(BATTERY_PIN);
-  }
-
-  const uint16_t adcAverage =
-      (adcSum + (BATTERY_ADC_SAMPLES / 2)) / BATTERY_ADC_SAMPLES;
-
-  // Коэффициент делителя в сотых: для 330 кОм / 10 кОм получится 3400.
-  const uint32_t dividerRatioX100 =
-      ((BATTERY_DIVIDER_TOP_OHM + BATTERY_DIVIDER_BOTTOM_OHM) * 100UL) /
-      BATTERY_DIVIDER_BOTTOM_OHM;
-
-  // Результат — сотые доли вольта. Арифметика целочисленная.
-  batteryVoltageCentiV =
-      (static_cast<uint32_t>(adcAverage) * BATTERY_ADC_REFERENCE_MV *
-       dividerRatioX100) / (1023UL * 1000UL);
-
-  // Если оба порога равны нулю, батарейная отсечка отключена для макета.
-  if (BATTERY_GENERATOR_STOP_CV == 0 &&
-      BATTERY_GENERATOR_RECOVERY_CV == 0) {
-    generatorBlockFlags &= static_cast<uint8_t>(~BLOCK_BATTERY_LOW);
-    return;
-  }
-
-  // Неправильные пороги запрещают генерацию.
-  if (BATTERY_GENERATOR_STOP_CV <= 0 ||
-      BATTERY_GENERATOR_RECOVERY_CV <= BATTERY_GENERATOR_STOP_CV) {
-    generatorBlockFlags |= BLOCK_BATTERY_LOW;
-    return;
-  }
-
-  // Низкое напряжение защёлкивает запрет до подтверждения сети
-  // и достижения порога восстановления.
-  if (batteryVoltageCentiV <= BATTERY_GENERATOR_STOP_CV) {
-    generatorBlockFlags |= BLOCK_BATTERY_LOW;
-  }
-}
-
-// ======================================================
-// ИНИЦИАЛИЗАЦИЯ
+// ИНИЦИАЛИЗАЦИЯ И ОСНОВНОЙ ЦИКЛ
 // ======================================================
 
 void setup() {
-  // Самое первое действие — все четыре выхода драйверов в LOW.
-  const uint8_t savedSREG = SREG;
-  cli();
+  // До передачи управления PIO все четыре вывода принудительно LOW.
+  pinMode(PIN_DRIVER_A_H, OUTPUT);
+  pinMode(PIN_DRIVER_A_L, OUTPUT);
+  pinMode(PIN_DRIVER_B_H, OUTPUT);
+  pinMode(PIN_DRIVER_B_L, OUTPUT);
 
-  PORTD &= static_cast<uint8_t>(~DRIVER_OUTPUT_MASK);
-  DDRD |= DRIVER_OUTPUT_MASK;
+  digitalWrite(PIN_DRIVER_A_H, LOW);
+  digitalWrite(PIN_DRIVER_A_L, LOW);
+  digitalWrite(PIN_DRIVER_B_H, LOW);
+  digitalWrite(PIN_DRIVER_B_L, LOW);
 
-  // После перевода PD4–PD7 в OUTPUT устанавливаем нормальное состояние:
-  // оба нижних плеча включены, оба верхних выключены.
-  writeDriverPattern(DRIVER_PATTERN_NORMAL);
+  // RUN — вход без внутренней подтяжки, как в исходной версии.
+  pinMode(PIN_RUN, INPUT);
 
-  // D8 — выход реле зарядки; пока реле всегда выключено.
-  PORTB &= static_cast<uint8_t>(~CHARGE_RELAY_MASK);
-  DDRB |= CHARGE_RELAY_MASK;
-
-  // Timer1 полностью остановлен и очищен.
-  TIMSK1 = 0;
-  TCCR1A = 0;
-  TCCR1B = 0;
-  TCCR1C = 0;
-  TCNT1 = 0;
-  OCR1A = 0;
-  OCR1B = 0;
-  TIFR1 = _BV(ICF1) | _BV(OCF1A) | _BV(OCF1B) | _BV(TOV1);
-
-  // A0 / PC0 — вход RUN, внутренняя подтяжка отключена.
-  DDRC &= static_cast<uint8_t>(~RUN_MASK);
-  PORTC &= static_cast<uint8_t>(~RUN_MASK);
-
-  SREG = savedSREG;
-
-  // Рассчитываем временные параметры Timer1.
-  const uint32_t timerClockHz = F_CPU / 8UL;
-  uint32_t halfPeriodTicks = 0;
-  uint32_t calculatedDeadTicks = 0;
-  uint32_t calculatedActiveTicks = 0;
-  uint32_t calculatedDriverDeadTicks = 0;
-  uint32_t calculatedInterphaseTicks = 0;
-  uint32_t calculatedPeriodTicks = 0;
-
-  if (UPS_FREQUENCY_HZ > 0 &&
-      UPS_DEADTIME_PERCENT > 0 &&
-      UPS_DEADTIME_PERCENT < 100 &&
-      UPS_DRIVER_DEADTIME_US > 0) {
-
-    halfPeriodTicks = timerClockHz / (2UL * UPS_FREQUENCY_HZ);
-    calculatedDeadTicks =
-        (halfPeriodTicks * UPS_DEADTIME_PERCENT) / 100UL;
-    calculatedActiveTicks = halfPeriodTicks - calculatedDeadTicks;
-
-    // Округляем защитную паузу вверх, чтобы не получить меньше заданного.
-    calculatedDriverDeadTicks =
-        (timerClockHz * UPS_DRIVER_DEADTIME_US + 999999UL) / 1000000UL;
-
-    calculatedPeriodTicks = 2UL * halfPeriodTicks;
-
-    // В каждом общем dead time размещаются две защитные паузы драйвера.
-    // Остаток — ожидание до точной границы следующего полупериода.
-    if (calculatedDeadTicks > (2UL * calculatedDriverDeadTicks)) {
-      calculatedInterphaseTicks =
-          calculatedDeadTicks - (2UL * calculatedDriverDeadTicks);
-    }
-
-    // Все отдельные интервалы должны помещаться в 16-битный Timer1.
-    if (halfPeriodTicks <= 65535UL &&
-        calculatedPeriodTicks <= 65535UL &&
-        calculatedActiveTicks > 0 &&
-        calculatedActiveTicks <= 65535UL &&
-        calculatedDeadTicks <= 65535UL &&
-        calculatedDriverDeadTicks > 0 &&
-        calculatedDriverDeadTicks <= 65535UL &&
-        calculatedInterphaseTicks > 0 &&
-        calculatedInterphaseTicks <= 65535UL) {
-
-      activeTicks = static_cast<uint16_t>(calculatedActiveTicks);
-      driverDeadTimeTicks = static_cast<uint16_t>(calculatedDriverDeadTicks);
-      interphaseWaitTicks = static_cast<uint16_t>(calculatedInterphaseTicks);
-      periodTicks = static_cast<uint16_t>(calculatedPeriodTicks);
-      generatorTimingValid = true;
-    }
+  if (!initializePioGenerator()) {
+    holdAllDriverOutputsLow();
   }
 
-  // Внутренняя опора АЦП ATmega328P — INTERNAL (номинально 1,1 В).
-  analogReference(INTERNAL);
-  delay(5);
-
-  // Первые преобразования после переключения опоры отбрасываем.
-  for (uint8_t i = 0; i < 4; i++) {
-    analogRead(BATTERY_PIN);
-  }
-
-  // Стартовая выдержка перед первой оценкой АКБ и RUN.
+  // Стартовая выдержка исходного проекта.
   delay(UPS_STARTUP_DELAY_MS);
 
-  measureBatteryVoltage();
-  lastBatteryMeasureMs = millis();
-  updateRunStatus(lastBatteryMeasureMs);
-
-  // Timer1 вызывает автомат на границах и в моменты переключения выходов.
-  // Первое событие через один тик начинает первый период без лишней паузы.
-  if (generatorTimingValid) {
-    const uint8_t startSREG = SREG;
-    cli();
-
-    TCNT1 = 0;
-    OCR1A = 1;
-    TIFR1 = _BV(OCF1A) | _BV(TOV1);
-    generatorPhase = GEN_PERIOD_BOUNDARY;
-    generatorRunning = false;
-
-    TIMSK1 = _BV(OCIE1A);
-    TCCR1B = _BV(CS11);  // Normal mode, предделитель 8.
-
-    lastTimer1Heartbeat = timer1Heartbeat;
-    lastTimer1HeartbeatMs = millis();
-
-    SREG = startSREG;
-  }
+  // Первое чтение RUN после стартовой выдержки.
+  updateRunStatus(millis());
+  applyGeneratorRunRequest();
 }
-
-// ======================================================
-// ОСНОВНОЙ ЦИКЛ
-// ======================================================
 
 void loop() {
   const uint32_t now = millis();
 
-  // Обновляем только программные переменные RUN; драйверы физический RUN
-  // непосредственно не читают.
   updateRunStatus(now);
-
-  // Контроль таймера и возврат в нормальное состояние при отсутствии событий.
-  superviseTimer(now);
-
-  // Измеряем напряжение АКБ раз в секунду, не блокируя Timer1.
-  if (now - lastBatteryMeasureMs >= BATTERY_MEASURE_INTERVAL_MS) {
-    lastBatteryMeasureMs = now;
-    measureBatteryVoltage();
-  }
-
-  // Снять батарейную защёлку можно только при подтверждённой сети
-  // и фактическом достижении напряжения восстановления.
-  if (mainsPresentConfirmed &&
-      BATTERY_GENERATOR_STOP_CV > 0 &&
-      BATTERY_GENERATOR_RECOVERY_CV > BATTERY_GENERATOR_STOP_CV &&
-      batteryVoltageCentiV >= BATTERY_GENERATOR_RECOVERY_CV) {
-    generatorBlockFlags &= static_cast<uint8_t>(~BLOCK_BATTERY_LOW);
-  }
-}
-
-// ======================================================
-// ПРЕРЫВАНИЕ TIMER1 — ЕДИНЫЙ АВТОМАТ ЧЕТЫРЁХ ВЫХОДОВ
-// ======================================================
-
-ISR(TIMER1_COMPA_vect) {
-  ++timer1Heartbeat;
-  driverControlStep();
+  applyGeneratorRunRequest();
 }
