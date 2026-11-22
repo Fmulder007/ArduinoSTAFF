@@ -1,22 +1,31 @@
 /*
-  ArduinoUPS — RP2040-Zero, четырёхвыходной PIO-генератор.
+  ArduinoUPS — RP2040-Zero, четыре выхода PIO, RUN, АКБ и журнал событий.
 
-  Перенос ветки arduino-ups-four-output-driver:
+  Выходы драйверов:
     GP0 — DRIVER_A_H: верхнее плечо драйвера A.
     GP1 — DRIVER_A_L: нижнее плечо драйвера A.
     GP2 — DRIVER_B_H: верхнее плечо драйвера B.
     GP3 — DRIVER_B_L: нижнее плечо драйвера B.
-    GP4 — RUN: HIGH = генерация нужна, LOW = сеть появилась.
 
-  Пока перенесены только четыре выхода и RUN. АКБ, реле, дисплей,
-  энкодер и остальные функции намеренно не включены.
+  Входы:
+    GP4  — RUN: HIGH = генерация нужна, LOW = сеть появилась.
+    GP26 — измерение напряжения аккумулятора, ADC0.
 
-  Все четыре выхода управляются одной инструкцией SET PINS автомата PIO.
+  OLED SSD1306 128x32 и будущие часы DS1307:
+    GP6 — I2C1 SDA (Wire1).
+    GP7 — I2C1 SCL (Wire1).
+
+  Пока дисплей показывает только журнал событий.
+  Дата/время временно заменены заглушкой до подключения DS1307.
+
+  PIO самостоятельно формирует все четыре сигнала.
   CPU не обслуживает отдельные фронты и не участвует в формировании
   временных интервалов.
 */
 
 #include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
 #include <hardware/clocks.h>
 #include <hardware/pio.h>
 
@@ -26,14 +35,15 @@
 // ВЫВОДЫ RP2040-ZERO
 // ======================================================
 
-// Четыре последовательных GPIO управляются одной SET PINS командой PIO.
 constexpr uint8_t PIN_DRIVER_A_H = 0;  // GP0
 constexpr uint8_t PIN_DRIVER_A_L = 1;  // GP1
 constexpr uint8_t PIN_DRIVER_B_H = 2;  // GP2
 constexpr uint8_t PIN_DRIVER_B_L = 3;  // GP3
 
-// Единственный физический вход этой испытательной версии.
 constexpr uint8_t PIN_RUN = 4;         // GP4
+constexpr uint8_t PIN_I2C_SDA = 6;     // GP6 / I2C1 SDA
+constexpr uint8_t PIN_I2C_SCL = 7;     // GP7 / I2C1 SCL
+constexpr uint8_t PIN_BATTERY = 26;    // GP26 / ADC0
 
 // ======================================================
 // ПАРАМЕТРЫ ГЕНЕРАТОРА
@@ -46,51 +56,91 @@ constexpr uint8_t PIN_RUN = 4;         // GP4
 #define UPS_RUN_OFF_DELAY_MS            5000UL
 
 // PIO работает на 2,5 МГц: один цикл = 0,4 мкс.
-// При штатной частоте clk_sys = 125 МГц делитель равен ровно 50,
-// то есть дробный делитель и его фазовая модуляция не используются.
+// При штатной частоте clk_sys = 125 МГц делитель равен ровно 50.
 constexpr uint32_t PIO_CLOCK_HZ = 2500000UL;
 
-// PIO IRQ0 используется как внутренний флаг STOP.
-// IRQ0 = 1: остановить на ближайшей границе полного периода.
+// PIO IRQ0 — внутренний флаг запроса остановки.
+// IRQ0 = 1: завершить текущий полный период A+B и ждать.
 // IRQ0 = 0: разрешить следующий полный период.
 constexpr uint8_t PIO_IRQ_STOP_REQUEST = 0;
 
-// Порядок битов SET PINS: GP3 GP2 GP1 GP0 = B_L B_H A_L A_H.
-constexpr uint8_t PATTERN_NORMAL       = 0b1010; // A_L + B_L
-constexpr uint8_t PATTERN_A_PREPARE    = 0b1000; // B_L
-constexpr uint8_t PATTERN_A_ACTIVE     = 0b1001; // B_L + A_H
-constexpr uint8_t PATTERN_B_PREPARE    = 0b0010; // A_L
-constexpr uint8_t PATTERN_B_ACTIVE     = 0b0110; // A_L + B_H
-constexpr uint8_t PATTERN_ALL_OFF      = 0b0000;
+// ======================================================
+// ПАРАМЕТРЫ ИЗМЕРЕНИЯ АКБ
+// ======================================================
 
-// Compile-time проверка: верхнее и нижнее плечи одного драйвера
-// ни в одном используемом шаблоне не включаются одновременно.
-constexpr uint8_t DRIVER_A_MASK = 0b0011;
-constexpr uint8_t DRIVER_B_MASK = 0b1100;
+#define BATTERY_MEASURE_INTERVAL_MS       1000UL
+#define BATTERY_ADC_SAMPLES                 16
+#define BATTERY_ADC_REFERENCE_MV          3300UL
+#define BATTERY_ADC_MAX_COUNTS            4095UL
 
-#define DRIVER_PATTERN_SAFE(value) \
-  ((((value) & DRIVER_A_MASK) != DRIVER_A_MASK) && \
-   (((value) & DRIVER_B_MASK) != DRIVER_B_MASK))
+#define BATTERY_DIVIDER_TOP_OHM         330000UL
+#define BATTERY_DIVIDER_BOTTOM_OHM       10000UL
 
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_NORMAL), "Unsafe NORMAL pattern");
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_A_PREPARE), "Unsafe A_PREPARE pattern");
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_A_ACTIVE), "Unsafe A_ACTIVE pattern");
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_B_PREPARE), "Unsafe B_PREPARE pattern");
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_B_ACTIVE), "Unsafe B_ACTIVE pattern");
-static_assert(DRIVER_PATTERN_SAFE(PATTERN_ALL_OFF), "Unsafe ALL_OFF pattern");
+// Пороги задаются в сотых долях вольта.
+// Нули временно отключают батарейную отсечку для макета.
+#define BATTERY_GENERATOR_STOP_CV             0
+#define BATTERY_GENERATOR_RECOVERY_CV         0
+#define BATTERY_CHARGE_ON_CV                  0
+#define BATTERY_CHARGE_OFF_CV                 0
+
+// ======================================================
+// БИТЫ ПРИЧИН ЗАПРЕТА ГЕНЕРАЦИИ
+// ======================================================
+
+#define BLOCK_BATTERY_LOW                   0x01
+#define BLOCK_OVERHEAT                      0x02
+#define BLOCK_OVERLOAD                     0x04
+#define BLOCK_MAINS_FAULT                  0x08
+#define BLOCK_SENSOR_FAULT                 0x10
+#define BLOCK_RESERVED_5                   0x20
+#define BLOCK_RESERVED_6                   0x40
+#define BLOCK_RESERVED_7                   0x80
+
+// 0 — запретов нет; любое ненулевое значение запрещает генерацию.
+// В этой версии фактически работает батарейный бит.
+// Остальные биты зарезервированы для будущих модулей защиты.
+volatile uint8_t generatorBlockFlags = 0;
+uint8_t lastLoggedBlockFlags = 0;
+
+// Последнее измеренное напряжение — сотые доли вольта.
+// Например, 1234 означает 12,34 В.
+uint16_t batteryVoltageCentiV = 0;
+uint32_t lastBatteryMeasureMs = 0;
 
 // ======================================================
 // СОСТОЯНИЕ RUN
 // ======================================================
 
-// Поведение перенесено из updateRunStatus() исходной четырёхвыходной ветки.
 bool runLowTiming = false;
 bool mainsPresentConfirmed = false;
 bool generatorRunRequest = false;
 uint32_t runLowSince = 0;
 
-// Состояние внутреннего разрешения PIO, последнее переданное из loop().
+// Последнее разрешение, переданное автомату PIO.
 bool pioRunPermissionApplied = false;
+
+// ======================================================
+// OLED И ЖУРНАЛ
+// ======================================================
+
+// SSD1306 128x32, полный буфер 512 байт, второй аппаратный I2C — Wire1.
+// Адрес определяется при старте: сначала 0x3C, затем 0x3D.
+U8G2_SSD1306_128X32_UNIVISION_F_2ND_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+
+constexpr uint8_t OLED_ADDRESS_1 = 0x3C;
+constexpr uint8_t OLED_ADDRESS_2 = 0x3D;
+constexpr uint32_t I2C_CLOCK_HZ = 100000UL;
+
+constexpr uint8_t LOG_HISTORY_LINES = 20;
+constexpr size_t LOG_LINE_BYTES = 96;
+constexpr uint8_t OLED_VISIBLE_LINES = 4;
+
+char logHistory[LOG_HISTORY_LINES][LOG_LINE_BYTES];
+uint8_t logHistoryHead = 0;
+uint8_t logHistoryCount = 0;
+
+bool oledReady = false;
+bool oledDirty = false;
 
 // ======================================================
 // БЕЗОПАСНОЕ СОСТОЯНИЕ ПРИ ОШИБКЕ ИНИЦИАЛИЗАЦИИ
@@ -111,24 +161,343 @@ static void holdAllDriverOutputsLow() {
   }
 
   while (true) {
-    // Ошибка конфигурации: не запускать силовые ключи.
+    // Ошибка конфигурации: силовые ключи не запускать.
   }
+}
+
+// ======================================================
+// ВРЕМЯ ДЛЯ ЖУРНАЛА
+// ======================================================
+
+// Временная заглушка до подключения DS1307.
+// Позже меняется только эта функция.
+static void getLogTimestamp(char *buffer, size_t bufferSize) {
+  snprintf(buffer, bufferSize, "--.--.---- --:--:--");
+}
+
+// ======================================================
+// ВЫВОД СОБЫТИЯ В SERIAL И OLED
+// ======================================================
+
+static void appendDisplayLine(const char *line) {
+  strncpy(logHistory[logHistoryHead], line, LOG_LINE_BYTES - 1);
+  logHistory[logHistoryHead][LOG_LINE_BYTES - 1] = '\0';
+
+  logHistoryHead++;
+  if (logHistoryHead >= LOG_HISTORY_LINES) {
+    logHistoryHead = 0;
+  }
+
+  if (logHistoryCount < LOG_HISTORY_LINES) {
+    logHistoryCount++;
+  }
+
+  oledDirty = true;
+}
+
+static uint8_t utf8CharacterBytes(uint8_t firstByte) {
+  if (firstByte < 0x80) return 1;
+  if ((firstByte & 0xE0) == 0xC0) return 2;
+  if ((firstByte & 0xF0) == 0xE0) return 3;
+  if ((firstByte & 0xF8) == 0xF0) return 4;
+  return 1;
+}
+
+// Перенос выполняется по границам UTF-8 символов.
+// Кириллические буквы никогда не разрезаются между строками.
+static void appendWrappedDisplayText(const char *text) {
+  if (!oledReady) {
+    return;
+  }
+
+  char line[LOG_LINE_BYTES];
+  size_t lineLength = 0;
+  line[0] = '\0';
+
+  const uint8_t *source = reinterpret_cast<const uint8_t *>(text);
+
+  while (*source != 0) {
+    const uint8_t characterLength = utf8CharacterBytes(*source);
+
+    if (lineLength + characterLength >= sizeof(line)) {
+      line[lineLength] = '\0';
+      appendDisplayLine(line);
+      lineLength = 0;
+      line[0] = '\0';
+    }
+
+    const size_t previousLength = lineLength;
+
+    for (uint8_t i = 0; i < characterLength; ++i) {
+      line[lineLength++] = static_cast<char>(source[i]);
+    }
+    line[lineLength] = '\0';
+
+    // Проверяем фактическую ширину строки выбранным шрифтом.
+    if (oled.getUTF8Width(line) > 128 && previousLength > 0) {
+      line[previousLength] = '\0';
+      appendDisplayLine(line);
+
+      lineLength = 0;
+      for (uint8_t i = 0; i < characterLength; ++i) {
+        line[lineLength++] = static_cast<char>(source[i]);
+      }
+      line[lineLength] = '\0';
+    }
+
+    source += characterLength;
+  }
+
+  if (lineLength > 0) {
+    appendDisplayLine(line);
+  }
+}
+
+static void updateLogDisplay() {
+  if (!oledReady || !oledDirty) {
+    return;
+  }
+
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_5x8_t_cyrillic);
+  oled.setFontPosTop();
+
+  uint8_t visibleCount = logHistoryCount;
+  if (visibleCount > OLED_VISIBLE_LINES) {
+    visibleCount = OLED_VISIBLE_LINES;
+  }
+
+  const uint8_t oldestIndex =
+      (logHistoryHead + LOG_HISTORY_LINES - logHistoryCount) %
+      LOG_HISTORY_LINES;
+
+  const uint8_t firstVisible =
+      logHistoryCount - visibleCount;
+
+  for (uint8_t row = 0; row < visibleCount; ++row) {
+    const uint8_t index =
+        (oldestIndex + firstVisible + row) % LOG_HISTORY_LINES;
+
+    oled.drawUTF8(
+        0,
+        static_cast<uint8_t>(row * 8),
+        logHistory[index]);
+  }
+
+  oled.sendBuffer();
+  oledDirty = false;
+}
+
+static void logEvent(const char *tag, const char *message) {
+  char timestamp[24];
+  char output[192];
+
+  getLogTimestamp(timestamp, sizeof(timestamp));
+
+  snprintf(
+      output,
+      sizeof(output),
+      "%s [%s] %s",
+      timestamp,
+      tag,
+      message);
+
+  // USB CDC не ждём: если терминал не открыт, событие остаётся на OLED.
+  if (Serial) {
+    Serial.println(output);
+  }
+
+  appendWrappedDisplayText(output);
+}
+
+// ======================================================
+// ИНИЦИАЛИЗАЦИЯ OLED НА I2C1
+// ======================================================
+
+static bool probeI2cAddress(uint8_t address) {
+  Wire1.beginTransmission(address);
+  return Wire1.endTransmission() == 0;
+}
+
+static void initializeLogDisplay() {
+  Wire1.setSDA(PIN_I2C_SDA);
+  Wire1.setSCL(PIN_I2C_SCL);
+  Wire1.begin();
+  Wire1.setClock(I2C_CLOCK_HZ);
+
+  uint8_t displayAddress = 0;
+
+  if (probeI2cAddress(OLED_ADDRESS_1)) {
+    displayAddress = OLED_ADDRESS_1;
+  } else if (probeI2cAddress(OLED_ADDRESS_2)) {
+    displayAddress = OLED_ADDRESS_2;
+  }
+
+  if (displayAddress == 0) {
+    oledReady = false;
+    return;
+  }
+
+  // U8g2 принимает 8-битный адрес: 7-битный адрес сдвигается влево.
+  oled.setI2CAddress(static_cast<uint8_t>(displayAddress << 1));
+  oled.setBusClock(I2C_CLOCK_HZ);
+  oled.begin();
+  oled.setFont(u8g2_font_5x8_t_cyrillic);
+  oled.setFontPosTop();
+
+  oledReady = true;
+  oledDirty = true;
+  updateLogDisplay();
+}
+
+// ======================================================
+// ОПИСАНИЯ ПРИЧИН ЗАПРЕТА
+// ======================================================
+
+static const char *blockReasonText(uint8_t bitMask) {
+  switch (bitMask) {
+    case BLOCK_BATTERY_LOW:
+      return "Низкое напряжение аккумулятора";
+
+    case BLOCK_OVERHEAT:
+      return "Перегрев";
+
+    case BLOCK_OVERLOAD:
+      return "Перегрузка";
+
+    case BLOCK_MAINS_FAULT:
+      return "Неисправность или недопустимое состояние сети";
+
+    case BLOCK_SENSOR_FAULT:
+      return "Неисправность датчика";
+
+    case BLOCK_RESERVED_5:
+      return "Резервная причина запрета 5";
+
+    case BLOCK_RESERVED_6:
+      return "Резервная причина запрета 6";
+
+    case BLOCK_RESERVED_7:
+      return "Резервная причина запрета 7";
+
+    default:
+      return "Неизвестная причина запрета";
+  }
+}
+
+static const char *blockClearedText(uint8_t bitMask) {
+  switch (bitMask) {
+    case BLOCK_BATTERY_LOW:
+      return "Блокировка по низкому напряжению снята";
+
+    case BLOCK_OVERHEAT:
+      return "Блокировка по перегреву снята";
+
+    case BLOCK_OVERLOAD:
+      return "Блокировка по перегрузке снята";
+
+    case BLOCK_MAINS_FAULT:
+      return "Блокировка по неисправности сети снята";
+
+    case BLOCK_SENSOR_FAULT:
+      return "Блокировка по неисправности датчика снята";
+
+    case BLOCK_RESERVED_5:
+      return "Снята резервная блокировка 5";
+
+    case BLOCK_RESERVED_6:
+      return "Снята резервная блокировка 6";
+
+    case BLOCK_RESERVED_7:
+      return "Снята резервная блокировка 7";
+
+    default:
+      return "Причина запрета снята";
+  }
+}
+
+// Пишем журнал только при изменении маски.
+// Отдельная запись — для каждой добавленной или снятой причины.
+// Общие BLOCK и ALLOW выводятся только при переходах 0 -> не 0 и не 0 -> 0.
+static void logBlockFlagsChanges() {
+  const uint8_t currentFlags = generatorBlockFlags;
+
+  if (currentFlags == lastLoggedBlockFlags) {
+    return;
+  }
+
+  const uint8_t addedFlags =
+      currentFlags & static_cast<uint8_t>(~lastLoggedBlockFlags);
+
+  const uint8_t removedFlags =
+      lastLoggedBlockFlags & static_cast<uint8_t>(~currentFlags);
+
+  for (uint8_t bit = 0; bit < 8; ++bit) {
+    const uint8_t bitMask = static_cast<uint8_t>(1U << bit);
+
+    if (addedFlags & bitMask) {
+      char message[128];
+
+      snprintf(
+          message,
+          sizeof(message),
+          "flags=0x%02X, %s",
+          currentFlags,
+          blockReasonText(bitMask));
+
+      logEvent("BLOCK", message);
+    }
+  }
+
+  if (lastLoggedBlockFlags == 0 && currentFlags != 0) {
+    char message[64];
+
+    snprintf(
+        message,
+        sizeof(message),
+        "flags=0x%02X, Генерация запрещена",
+        currentFlags);
+
+    logEvent("BLOCK", message);
+  }
+
+  for (uint8_t bit = 0; bit < 8; ++bit) {
+    const uint8_t bitMask = static_cast<uint8_t>(1U << bit);
+
+    if (removedFlags & bitMask) {
+      char message[128];
+
+      snprintf(
+          message,
+          sizeof(message),
+          "flags=0x%02X, %s",
+          currentFlags,
+          blockClearedText(bitMask));
+
+      logEvent("CLEAR", message);
+    }
+  }
+
+  if (lastLoggedBlockFlags != 0 && currentFlags == 0) {
+    logEvent(
+        "ALLOW",
+        "flags=0x00, Все запреты генерации сняты");
+  }
+
+  lastLoggedBlockFlags = currentFlags;
 }
 
 // ======================================================
 // РАСЧЁТ ВРЕМЕННЫХ ИНТЕРВАЛОВ ДЛЯ PIO
 // ======================================================
 
-// Параметры передаются в PIO как значения счётчика X.
-//
-// Обычная задержка между двумя SET PINS:
-//   SET PINS + MOV X, регистр + (X + 1) инструкций JMP X--
+// Для задержки между двумя SET PINS:
+// SET + MOV X + (X + 1) команд JMP X-- + следующий SET.
 // Поэтому X = длительность_в_тактах - 3.
 //
-// Межполупериодная задержка использует дополнительный NOP в первой
-// половине и WAIT 0 IRQ на границе периода во второй. Эти две инструкции
-// компенсируют друг друга, поэтому обе межполупериодные паузы остаются
-// одинаковыми и полный период составляет ровно 20 мс.
+// В межполупериодной задержке есть дополнительный NOP.
+// На границе полного периода вместо NOP выполняется WAIT.
+// Эти две инструкции компенсируют друг друга.
 static bool calculatePioDelayCounts(
     uint32_t &activeLoopCount,
     uint32_t &driverLoopCount,
@@ -156,7 +525,6 @@ static bool calculatePioDelayCounts(
   const uint32_t activeTicks =
       halfPeriodTicks - deadTimeTicks;
 
-  // Округление вверх — защитная пауза не может быть короче заданной.
   const uint64_t driverTicksNumerator =
       static_cast<uint64_t>(PIO_CLOCK_HZ) * UPS_DRIVER_DEADTIME_US;
 
@@ -164,8 +532,6 @@ static bool calculatePioDelayCounts(
       static_cast<uint32_t>(
           (driverTicksNumerator + 999999ULL) / 1000000ULL);
 
-  // В общем dead time две защитные паузы драйверов,
-  // остаток — межполупериодное ожидание.
   if (deadTimeTicks <= (2UL * driverDeadTimeTicks)) {
     return false;
   }
@@ -173,7 +539,6 @@ static bool calculatePioDelayCounts(
   const uint32_t interphaseTicks =
       deadTimeTicks - (2UL * driverDeadTimeTicks);
 
-  // Проверяем минимальные значения, необходимые для счётных циклов PIO.
   if (activeTicks <= 3UL ||
       driverDeadTimeTicks <= 3UL ||
       interphaseTicks <= 4UL) {
@@ -192,17 +557,15 @@ static bool calculatePioDelayCounts(
 // ======================================================
 
 static bool initializePioGenerator() {
-  // PIO-программа занимает всю память инструкций PIO0 (32 слова)
-  // и загружается с фиксированного адреса 0, на который рассчитаны JMP.
   if (!pio_can_add_program_at_offset(
-          pio0, &ups_driver_program, 0)) {
+          pio0,
+          &ups_driver_program,
+          0)) {
     return false;
   }
 
   const uint32_t systemClockHz = clock_get_hz(clk_sys);
 
-  // Требуем целый делитель. Для штатных 125 МГц это ровно 50,
-  // следовательно PIO получает стабильные 2,5 МГц без дробного деления.
   if ((systemClockHz % PIO_CLOCK_HZ) != 0) {
     return false;
   }
@@ -238,7 +601,6 @@ static bool initializePioGenerator() {
 
   pio_sm_config config = pio_get_default_sm_config();
 
-  // SET PINS управляет GP0–GP3 одной четырёхбитной командой.
   sm_config_set_set_pins(
       &config,
       PIN_DRIVER_A_H,
@@ -249,7 +611,6 @@ static bool initializePioGenerator() {
       UPS_DRIVER_PIO_WRAP_TARGET,
       UPS_DRIVER_PIO_WRAP);
 
-  // Только целый делитель частоты PIO.
   sm_config_set_clkdiv_int_frac8(
       &config,
       clockDivider,
@@ -270,17 +631,16 @@ static bool initializePioGenerator() {
     return false;
   }
 
-  // До запуска программы сразу устанавливаем безопасное нормальное
-  // состояние: оба нижних плеча включены, оба верхних выключены.
+  // Безопасное рабочее состояние: включены оба нижних плеча.
   pio_sm_set_pins_with_mask(
       pio0,
       static_cast<uint>(sm),
-      PATTERN_NORMAL,
+      0b1010,
       0x0F);
 
-  // PIO-программа загружает эти три значения в Y, ISR и OSR:
-  // Y   — длительность активного импульса 9 мс;
-  // ISR — защитная пауза драйвера 50 мкс;
+  // TX FIFO:
+  // Y   — активный импульс 9 мс;
+  // ISR — защитная пауза 50 мкс;
   // OSR — межполупериодное ожидание 900 мкс.
   pio_sm_put_blocking(
       pio0,
@@ -297,8 +657,7 @@ static bool initializePioGenerator() {
       static_cast<uint>(sm),
       interphaseLoopCount);
 
-  // Сначала устанавливаем STOP, чтобы PIO остался в NORMAL
-  // и не начал генерацию до подтверждения RUN.
+  // До получения разрешения PIO остаётся в NORMAL.
   pio_interrupt_clear(pio0, PIO_IRQ_STOP_REQUEST);
   pio0->irq_force = (1u << PIO_IRQ_STOP_REQUEST);
   pioRunPermissionApplied = false;
@@ -309,29 +668,36 @@ static bool initializePioGenerator() {
 }
 
 // ======================================================
-// КОНТРОЛЬ ВХОДА RUN
+// КОНТРОЛЬ RUN
 // ======================================================
 
-void updateRunStatus(uint32_t now) {
-  // Только эта функция читает физический вход RUN.
+static void updateRunStatus(uint32_t now) {
+  // Только эта функция читает физический вход GP4/RUN.
   const bool runIsHigh = (digitalRead(PIN_RUN) == HIGH);
-  bool runLowConfirmed = false;
+
+  const bool oldMainsConfirmed = mainsPresentConfirmed;
+  const bool oldGeneratorRequest = generatorRunRequest;
 
   if (runIsHigh) {
     runLowTiming = false;
+    mainsPresentConfirmed = false;
+    generatorRunRequest = true;
   } else if (!runLowTiming) {
     runLowTiming = true;
     runLowSince = now;
   } else if (now - runLowSince >= UPS_RUN_OFF_DELAY_MS) {
-    runLowConfirmed = true;
-  }
-
-  if (runIsHigh) {
-    mainsPresentConfirmed = false;
-    generatorRunRequest = true;
-  } else if (runLowConfirmed) {
     mainsPresentConfirmed = true;
     generatorRunRequest = false;
+  }
+
+  if (!oldMainsConfirmed && mainsPresentConfirmed) {
+    logEvent("RUN", "Сеть подтверждена");
+  } else if (oldMainsConfirmed && !mainsPresentConfirmed) {
+    logEvent("RUN", "Сеть пропала");
+  }
+
+  if (!oldGeneratorRequest && generatorRunRequest) {
+    logEvent("RUN", "Запрошена генерация");
   }
 }
 
@@ -339,34 +705,114 @@ void updateRunStatus(uint32_t now) {
 // ПЕРЕДАЧА РАЗРЕШЕНИЯ ГЕНЕРАТОРУ PIO
 // ======================================================
 
-// PIO проверяет флаг только на границе полного периода.
-// IRQ0 = 0 — следующий период разрешён.
-// IRQ0 = 1 — текущий период завершается, затем PIO остаётся в NORMAL.
-//
-// WAIT 0 IRQ не очищает флаг при выполнении условия. Это позволяет
-// использовать IRQ0 как устойчивый уровень разрешения/запрета.
-static void applyGeneratorRunRequest() {
-  if (generatorRunRequest == pioRunPermissionApplied) {
+// PIO проверяет STOP только на границе полного периода A+B.
+// Генерация разрешена, только если RUN запрашивает её и маска запретов = 0.
+static void applyGeneratorPermission() {
+  const bool permission =
+      generatorRunRequest && (generatorBlockFlags == 0);
+
+  if (permission == pioRunPermissionApplied) {
     return;
   }
 
-  if (generatorRunRequest) {
-    // Снять STOP: PIO сможет начать следующий период.
+  if (permission) {
     pio_interrupt_clear(pio0, PIO_IRQ_STOP_REQUEST);
   } else {
-    // Установить STOP: PIO остановится только после полного периода A+B.
     pio0->irq_force = (1u << PIO_IRQ_STOP_REQUEST);
   }
 
-  pioRunPermissionApplied = generatorRunRequest;
+  pioRunPermissionApplied = permission;
 }
 
 // ======================================================
-// ИНИЦИАЛИЗАЦИЯ И ОСНОВНОЙ ЦИКЛ
+// ИЗМЕРЕНИЕ НАПРЯЖЕНИЯ АККУМУЛЯТОРА
+// ======================================================
+
+static void measureBatteryVoltage() {
+  uint32_t adcSum = 0;
+
+  for (uint8_t i = 0; i < BATTERY_ADC_SAMPLES; ++i) {
+    adcSum += static_cast<uint32_t>(analogRead(PIN_BATTERY));
+  }
+
+  const uint16_t adcAverage =
+      static_cast<uint16_t>(
+          (adcSum + (BATTERY_ADC_SAMPLES / 2)) / BATTERY_ADC_SAMPLES);
+
+  const uint32_t dividerRatioX100 =
+      ((BATTERY_DIVIDER_TOP_OHM + BATTERY_DIVIDER_BOTTOM_OHM) * 100UL) /
+      BATTERY_DIVIDER_BOTTOM_OHM;
+
+  // Результат в сотых долях вольта.
+  // uint64_t нужен, чтобы промежуточное произведение не переполнилось.
+  const uint64_t numerator =
+      static_cast<uint64_t>(adcAverage) *
+      BATTERY_ADC_REFERENCE_MV *
+      dividerRatioX100;
+
+  batteryVoltageCentiV =
+      static_cast<uint16_t>(
+          numerator /
+          (static_cast<uint64_t>(BATTERY_ADC_MAX_COUNTS) * 1000ULL));
+
+  // Нулевые пороги временно отключают батарейную отсечку.
+  if (BATTERY_GENERATOR_STOP_CV == 0 &&
+      BATTERY_GENERATOR_RECOVERY_CV == 0) {
+    generatorBlockFlags &=
+        static_cast<uint8_t>(~BLOCK_BATTERY_LOW);
+    return;
+  }
+
+  // Неправильно заданные пороги запрещают генерацию.
+  if (BATTERY_GENERATOR_STOP_CV <= 0 ||
+      BATTERY_GENERATOR_RECOVERY_CV <= BATTERY_GENERATOR_STOP_CV) {
+    generatorBlockFlags |= BLOCK_BATTERY_LOW;
+    return;
+  }
+
+  // Низкое напряжение защёлкивает запрет.
+  // Самостоятельный подъём напряжения после снятия нагрузки не снимает его.
+  if (batteryVoltageCentiV <= BATTERY_GENERATOR_STOP_CV) {
+    generatorBlockFlags |= BLOCK_BATTERY_LOW;
+  }
+}
+
+// Снять батарейную защёлку можно только при подтверждённой сети
+// и достижении порога восстановления.
+static void checkBatteryRecovery() {
+  if (!mainsPresentConfirmed ||
+      (generatorBlockFlags & BLOCK_BATTERY_LOW) == 0 ||
+      BATTERY_GENERATOR_STOP_CV <= 0 ||
+      BATTERY_GENERATOR_RECOVERY_CV <= BATTERY_GENERATOR_STOP_CV ||
+      batteryVoltageCentiV < BATTERY_GENERATOR_RECOVERY_CV) {
+    return;
+  }
+
+  logEvent(
+      "RECOVERY",
+      "Напряжение аккумулятора восстановлено");
+
+  generatorBlockFlags &=
+      static_cast<uint8_t>(~BLOCK_BATTERY_LOW);
+}
+
+// ======================================================
+// ИНИЦИАЛИЗАЦИЯ
 // ======================================================
 
 void setup() {
-  // До передачи управления PIO все четыре вывода принудительно LOW.
+  // USB CDC Serial. Значение 9600 оставлено для совместимости
+  // с терминалами, которые требуют указать скорость COM-порта.
+  Serial.begin(9600);
+
+  // Вход RUN без внутренней подтяжки — как в исходной версии.
+  pinMode(PIN_RUN, INPUT);
+
+  // АЦП RP2040: 12 бит, диапазон 0..4095.
+  analogReadResolution(12);
+  pinMode(PIN_BATTERY, INPUT);
+
+  // До передачи GP0–GP3 автомату PIO все четыре выхода LOW.
   pinMode(PIN_DRIVER_A_H, OUTPUT);
   pinMode(PIN_DRIVER_A_L, OUTPUT);
   pinMode(PIN_DRIVER_B_H, OUTPUT);
@@ -377,24 +823,62 @@ void setup() {
   digitalWrite(PIN_DRIVER_B_H, LOW);
   digitalWrite(PIN_DRIVER_B_L, LOW);
 
-  // RUN — вход без внутренней подтяжки, как в исходной версии.
-  pinMode(PIN_RUN, INPUT);
+  // I2C1 и OLED. DS1307 в будущем подключится к той же шине.
+  initializeLogDisplay();
+
+  logEvent("BOOT", "ArduinoUPS RP2040 запущен");
+
+  if (!oledReady) {
+    logEvent("OLED", "Дисплей SSD1306 не обнаружен");
+  }
 
   if (!initializePioGenerator()) {
+    logEvent("ERROR", "Не удалось запустить автомат PIO");
+    updateLogDisplay();
     holdAllDriverOutputsLow();
   }
 
-  // Стартовая выдержка исходного проекта.
+  // Первые отсчёты отбрасываем после настройки АЦП.
+  for (uint8_t i = 0; i < 4; ++i) {
+    analogRead(PIN_BATTERY);
+  }
+
+  // Стартовая выдержка из исходной четырёхвыходной версии.
   delay(UPS_STARTUP_DELAY_MS);
 
-  // Первое чтение RUN после стартовой выдержки.
-  updateRunStatus(millis());
-  applyGeneratorRunRequest();
+  // Первое измерение АКБ выполняется до разрешения генерации.
+  measureBatteryVoltage();
+  lastBatteryMeasureMs = millis();
+
+  updateRunStatus(lastBatteryMeasureMs);
+  checkBatteryRecovery();
+  logBlockFlagsChanges();
+  applyGeneratorPermission();
+  updateLogDisplay();
 }
+
+// ======================================================
+// ОСНОВНОЙ ЦИКЛ
+// ======================================================
 
 void loop() {
   const uint32_t now = millis();
 
   updateRunStatus(now);
-  applyGeneratorRunRequest();
+
+  // Измерение АКБ раз в секунду. PIO продолжает генерацию автономно.
+  if (now - lastBatteryMeasureMs >= BATTERY_MEASURE_INTERVAL_MS) {
+    lastBatteryMeasureMs = now;
+    measureBatteryVoltage();
+  }
+
+  checkBatteryRecovery();
+
+  // Сначала регистрируем изменение запретов, затем передаём PIO
+  // актуальное разрешение на следующий полный период.
+  logBlockFlagsChanges();
+  applyGeneratorPermission();
+
+  // OLED обновляется только после появления новых сообщений.
+  updateLogDisplay();
 }
