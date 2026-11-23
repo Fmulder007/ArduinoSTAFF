@@ -641,11 +641,16 @@ static bool initializePioGenerator() {
 
   generatorPioSm = generatorSm;
 
-  pio_add_program_at_offset(pio0, &ups_driver_program, 0);
-  pio_add_program_at_offset(
-      pio0,
-      &drain_monitor_program,
-      DRAIN_MONITOR_PROGRAM_OFFSET);
+  if (pio_add_program_at_offset(pio0, &ups_driver_program, 0) != 0) {
+    return false;
+  }
+
+  if (pio_add_program_at_offset(
+          pio0,
+          &drain_monitor_program,
+          DRAIN_MONITOR_PROGRAM_OFFSET) != DRAIN_MONITOR_PROGRAM_OFFSET) {
+    return false;
+  }
 
   // PIO0 SM0 — генератор.
   pio_sm_config generatorConfig = pio_get_default_sm_config();
@@ -665,12 +670,14 @@ static bool initializePioGenerator() {
       UPS_DRIVER_PIO_WRAP_TARGET,
       &generatorConfig);
 
-  pio_sm_set_consecutive_pindirs(
-      pio0,
-      static_cast<uint>(generatorSm),
-      PIN_DRIVER_A_H,
-      4,
-      true);
+  if (pio_sm_set_consecutive_pindirs(
+          pio0,
+          static_cast<uint>(generatorSm),
+          PIN_DRIVER_A_H,
+          4,
+          true) != PICO_OK) {
+    return false;
+  }
 
   pio_sm_set_pins_with_mask(
       pio0,
@@ -737,12 +744,14 @@ static bool initializePioGenerator() {
       DRAIN_MONITOR_PROGRAM_OFFSET,
       &monitorConfig);
 
-  pio_sm_set_consecutive_pindirs(
-      pio0,
-      static_cast<uint>(monitorSm),
-      PIN_DRAIN_A_FB,
-      2,
-      false);
+  if (pio_sm_set_consecutive_pindirs(
+          pio0,
+          static_cast<uint>(monitorSm),
+          PIN_DRAIN_A_FB,
+          2,
+          false) != PICO_OK) {
+    return false;
+  }
 
   pio_gpio_init(pio0, PIN_DRAIN_A_FB);
   pio_gpio_init(pio0, PIN_DRAIN_B_FB);
