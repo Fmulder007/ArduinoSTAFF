@@ -134,7 +134,6 @@ bool pioRunPermissionApplied = false;
 // Фактическое состояние PIO-генератора, доступное другим модулям.
 volatile bool generatorIsRunning = false;
 static int generatorPioSm = -1;
-static int drainMonitorSm = -1;
 static bool generatorFaultLatched = false;
 
 // ======================================================
@@ -641,7 +640,6 @@ static bool initializePioGenerator() {
   }
 
   generatorPioSm = generatorSm;
-  drainMonitorSm = monitorSm;
 
   if (pio_add_program_at_offset(pio0, &ups_driver_program, 0) != 0) {
     return false;
@@ -799,8 +797,8 @@ static void serviceGeneratorPioFault() {
         false);
   }
 
-  // drainMonitorSm намеренно НЕ отключаем: SM1 продолжает аппаратно
-  // удерживать NORMAL на GP0..GP3 после остановки SM0.
+  // SM1 намеренно НЕ отключаем: он продолжает аппаратно удерживать
+  // NORMAL на GP0..GP3 после остановки SM0.
 
   logEvent(
       "ERROR",
