@@ -664,11 +664,13 @@ static bool initializePioGenerator() {
 
   // Сначала инициализируем SM0 без side-set, чтобы безопасно
   // выставить NORMAL в выходной защёлке до подключения GPIO к PIO.
-  pio_sm_init(
-      pio0,
-      static_cast<uint>(generatorSm),
-      UPS_DRIVER_PIO_WRAP_TARGET,
-      &generatorConfig);
+  if (pio_sm_init(
+          pio0,
+          static_cast<uint>(generatorSm),
+          UPS_DRIVER_PIO_WRAP_TARGET,
+          &generatorConfig) != PICO_OK) {
+    return false;
+  }
 
   if (pio_sm_set_consecutive_pindirs(
           pio0,
@@ -738,11 +740,13 @@ static bool initializePioGenerator() {
       DRAIN_MONITOR_WRAP);
   sm_config_set_clkdiv_int_frac8(&monitorConfig, clockDivider, 0);
 
-  pio_sm_init(
-      pio0,
-      static_cast<uint>(monitorSm),
-      DRAIN_MONITOR_PROGRAM_OFFSET,
-      &monitorConfig);
+  if (pio_sm_init(
+          pio0,
+          static_cast<uint>(monitorSm),
+          DRAIN_MONITOR_PROGRAM_OFFSET,
+          &monitorConfig) != PICO_OK) {
+    return false;
+  }
 
   if (pio_sm_set_consecutive_pindirs(
           pio0,
