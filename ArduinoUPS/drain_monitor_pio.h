@@ -1,54 +1,48 @@
 /*
-  PIO1 SM0: независимый монитор двух датчиков стоков в режиме GENERATION.
+  PIO0 SM1: автономный монитор датчиков стоков.
 
-  Монитор ждёт фактического фронта команды A (GP0), через четверть периода
-  считывает GP27/GP28 одной командой IN PINS, 2 и проверяет комбинацию 00.
-  Затем аналогично ждёт команду B (GP2).
+  Программа занимает 13 инструкций и загружается в PIO0 по адресу 17.
+  Общая память PIO0: генератор SM0 (17 слов) + монитор SM1 (13 слов)
+  = 30 из 32 слов.
 
-  При 00 PIO1 поднимает GP5 (внутреннюю линию PIO1 -> PIO0).
-  PIO0 обнаруживает этот уровень непосредственно в своём активном цикле,
-  переводит GP0..GP3 в NORMAL и устанавливает собственный IRQ1.
+  На старте ISR получает quarterCheckLoopCount, Y — адрес wait_b (24).
+  После выборки A SM1 переходит на wait_b; после выборки B — на wait_a (17).
 
-  PIO1 программа занимает 20 инструкций. Все временные расчёты целочисленные.
+  При 00 инструкция IRQ SET1 одновременно выдаёт NORMAL через optional
+  side-set4. SM1 (номер 1) имеет приоритет над SM0 (номер 0) на GP0..GP3
+  и удерживает NORMAL в fault_hold. GP5 и PIO1 для этой связи не нужны.
 */
-
 #pragma once
 
 #include <hardware/pio.h>
 
-#define DRAIN_MONITOR_WRAP_TARGET 0
-#define DRAIN_MONITOR_WRAP        19
-#define DRAIN_MONITOR_FAULT_PC    18
+#define DRAIN_MONITOR_PROGRAM_OFFSET 17
+#define DRAIN_MONITOR_WAIT_A_PC      17
+#define DRAIN_MONITOR_WAIT_B_PC      24
+#define DRAIN_MONITOR_WRAP_TARGET   17
+#define DRAIN_MONITOR_WRAP          29
+#define DRAIN_MONITOR_FAULT_PC      28
+#define DRAIN_MONITOR_LENGTH        13
 
 static const uint16_t drain_monitor_program_instructions[] = {
-    0x80A0, //  0: pull block               (quarter-period loop count)
-    0x2080, //  1: wait 1 gpio 0            (A gate command active)
-    0xA027, //  2: mov x, osr
-    0x0043, //  3: jmp x--, 3               (quarter-period delay)
-    0xA0C3, //  4: mov isr, null
-    0x4002, //  5: in pins, 2               (GP27, GP28)
-    0xA026, //  6: mov x, isr
-    0x0032, //  7: jmp !x, 18              (both sensors LOW -> fault)
-
-    0x2000, //  8: wait 0 gpio 0            (A command ended)
-    0x2082, //  9: wait 1 gpio 2            (B gate command active)
-    0xA027, // 10: mov x, osr
-    0x004B, // 11: jmp x--, 11              (quarter-period delay)
-    0xA0C3, // 12: mov isr, null
-    0x4002, // 13: in pins, 2               (GP27, GP28)
-    0xA026, // 14: mov x, isr
-    0x0032, // 15: jmp !x, 18              (both sensors LOW -> fault)
-
-    0x2002, // 16: wait 0 gpio 2            (B command ended)
-    0x0001, // 17: jmp 1                   (wait for next A command)
-
-    0xE001, // 18: set pins, 1              (raise GP5 fault link)
-    0x0013  // 19: jmp 19                  (latch fault level)
+    0x2080, //  0: wait 1 gpio 0
+    0xA026, //  1: mov x, isr
+    0x0042, //  2: jmp x--, 2
+    0xA0E0, //  3: mov osr, pins
+    0x6022, //  4: out x, 2
+    0x002B, //  5: jmp !x, 11
+    0xA0A2, //  6: mov pc, y
+    0x2082, //  7: wait 1 gpio 2
+    0xE051, //  8: set y, 17 (absolute PIO0 address)
+    0xA026, //  9: mov x, isr
+    0x0002, // 10: jmp 2
+    0xDA01, // 11: irq set 1             side-set optional 1010
+    0x1A0C  // 12: jmp 12                side-set optional 1010
 };
 
 static const pio_program_t drain_monitor_program = {
     drain_monitor_program_instructions,
-    20,
-    0,
+    DRAIN_MONITOR_LENGTH,
+    -1,
     0
 };
