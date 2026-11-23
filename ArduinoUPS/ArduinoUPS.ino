@@ -9,7 +9,7 @@
 
   Входы:
     GP4  — RUN: HIGH = генерация нужна, LOW = сеть появилась.
-    GP5  — внутренняя линия аварии PIO1 -> PIO0 (внешняя проводка не нужна).
+    GP5  — свободен; авария передаётся между SM внутри PIO0 через side-set.
     GP26 — измерение напряжения аккумулятора, ADC0.
     GP27 — DRAIN_A_FB, датчик стока A.
     GP28 — DRAIN_B_FB, датчик стока B.
@@ -22,9 +22,9 @@
   Пока дисплей показывает только журнал событий.
   Дата/время временно заменены заглушкой до подключения DS1307.
 
-  PIO0 формирует четыре сигнала драйверов и самостоятельно аварийно
-  переводит их в NORMAL при сигнале монитора стоков PIO1.
-  PIO1 контролирует GP27/GP28; WS2812 передаёт данные через UART0 + DMA.
+  PIO0 SM0 формирует четыре сигнала драйверов. PIO0 SM1 контролирует
+  GP27/GP28 и при 00 аппаратно перехватывает GP0..GP3, удерживая NORMAL.
+  PIO1 полностью свободен; WS2812 передаёт данные через UART0 + DMA.
   CPU не обслуживает передачу отдельных битов светодиода и отдельные фронты
   силовых сигналов и не участвует
   в формировании их временных интервалов.
@@ -35,6 +35,7 @@
 #include "src/libraries/GyverOLED/src/GyverOLED.h"
 #include <hardware/clocks.h>
 #include <hardware/pio.h>
+#include <hardware/pio_instructions.h>
 
 #include "driver_pio.h"
 #include "drain_monitor_pio.h"
@@ -50,7 +51,6 @@ constexpr uint8_t PIN_DRIVER_B_H = 2;  // GP2
 constexpr uint8_t PIN_DRIVER_B_L = 3;  // GP3
 
 constexpr uint8_t PIN_RUN = 4;                 // GP4
-constexpr uint8_t PIN_PIO_FAULT_LINK = 5;       // GP5 / PIO1 -> PIO0
 constexpr uint8_t PIN_I2C_SDA = 8;               // GP8 / I2C0 SDA
 constexpr uint8_t PIN_I2C_SCL = 9;               // GP9 / I2C0 SCL
 constexpr uint8_t PIN_BATTERY = 26;              // GP26 / ADC0
@@ -71,8 +71,8 @@ constexpr uint8_t PIN_DRAIN_B_FB = 28;           // GP28 / DRAIN_B_FB
 // При штатной частоте clk_sys = 125 МГц делитель равен ровно 50.
 constexpr uint32_t PIO_CLOCK_HZ = 2500000UL;
 
-// PIO IRQ0 — штатный запрос остановки на границе полного периода A+B.
-// PIO IRQ1 — авария датчиков стоков; выходы уже переведены в NORMAL.
+// PIO0 IRQ0 — штатный запрос остановки на границе полного периода A+B.
+// PIO0 IRQ1 — авария датчиков стоков; SM1 уже удерживает выходы в NORMAL.
 constexpr uint8_t PIO_IRQ_STOP_REQUEST = 0;
 constexpr uint8_t PIO_IRQ_DRAIN_FAULT = 1;
 
@@ -564,29 +564,30 @@ static bool calculatePioDelayCounts(
   if (driverDeadTimeTicks <= 2UL ||
       deadTimeTicks <= (2UL * driverDeadTimeTicks) ||
       quarterPeriodTicks <= 4UL ||
-      activeTicks <= (quarterPeriodTicks + 4UL)) {
+      activeTicks <= quarterPeriodTicks ||
+      activeTicks <= 2UL) {
     return false;
   }
 
   const uint32_t interphaseTicks =
       deadTimeTicks - (2UL * driverDeadTimeTicks);
 
-  if (interphaseTicks <= 3UL || activeTicks < 4UL) {
+  if (interphaseTicks <= 3UL) {
     return false;
   }
 
-  // Активная петля: MOV X,Y + NOP + (JMP PIN + JMP X--) * (N+1).
-  // Длительность активной части округляется до ближайшей пары тактов PIO.
-  const uint32_t activeEvenTicks = (activeTicks + 1UL) & ~1UL;
-  activeLoopCount = (activeEvenTicks - 4UL) / 2UL;
-
-  // Каждая пауза: MOV X,reg + N+1 циклов JMP X-- = N+2 тактов.
+  // Генератор использует MOV X,reg (1 такт) + N+1 команд JMP X--.
+  // Поэтому N = длительность интервала - 2.
+  activeLoopCount = activeTicks - 2UL;
   driverLoopCount = driverDeadTimeTicks - 2UL;
+
+  // A->B: MOV X,OSR с задержкой [1] + JMP-петля = N+3.
+  // B->A: MOV X,OSR + JMP-петля = N+2, затем WAIT на границе периода
+  // добавляет ещё один такт. Обе межфазные паузы получаются равными.
   interphaseLoopCount = interphaseTicks - 3UL;
 
-  // После обнаружения фронта PIO выполняет WAIT (1 такт), затем MOV X,OSR,
-  // N+1 команд JMP X-- и MOV ISR,NULL. На следующем такте выполняется IN PINS,2,
-  // и именно в этот момент считываются датчики. Поэтому N = четверть периода - 4.
+  // WAIT видит фронт на следующем синхронном такте SM, затем MOV X,ISR,
+  // N+1 команд JMP X-- и выборка MOV OSR,PINS. N = четверть периода - 4.
   quarterCheckLoopCount = quarterPeriodTicks - 4UL;
 
   return true;
@@ -597,119 +598,6 @@ static bool calculatePioDelayCounts(
 // ======================================================
 
 static bool initializePioGenerator() {
-  if (!pio_can_add_program_at_offset(
-          pio0,
-          &ups_driver_program,
-          0)) {
-    return false;
-  }
-
-  const uint32_t systemClockHz = clock_get_hz(clk_sys);
-
-  if ((systemClockHz % PIO_CLOCK_HZ) != 0) {
-    return false;
-  }
-
-  const uint32_t clockDivider = systemClockHz / PIO_CLOCK_HZ;
-
-  if (clockDivider == 0 || clockDivider > 65535UL) {
-    return false;
-  }
-
-  uint32_t activeLoopCount = 0;
-  uint32_t driverLoopCount = 0;
-  uint32_t interphaseLoopCount = 0;
-  uint32_t quarterCheckLoopCount = 0;
-
-  if (!calculatePioDelayCounts(
-          activeLoopCount,
-          driverLoopCount,
-          interphaseLoopCount,
-          quarterCheckLoopCount)) {
-    return false;
-  }
-
-  const int sm = pio_claim_unused_sm(pio0, false);
-  if (sm < 0) {
-    return false;
-  }
-  generatorPioSm = sm;
-
-  const int programOffset =
-      pio_add_program_at_offset(pio0, &ups_driver_program, 0);
-
-  if (programOffset != 0) {
-    return false;
-  }
-
-  pio_sm_config config = pio_get_default_sm_config();
-
-  // Сначала настраиваем SET pins и PIO без side-set.
-  // Направления и выходной latch NORMAL задаются до подключения GPIO к PIO.
-  sm_config_set_set_pins(&config, PIN_DRIVER_A_H, 4);
-
-  sm_config_set_wrap(
-      &config,
-      UPS_DRIVER_PIO_WRAP_TARGET,
-      UPS_DRIVER_PIO_WRAP);
-
-  sm_config_set_clkdiv_int_frac8(
-      &config,
-      clockDivider,
-      0);
-
-  pio_sm_init(pio0, static_cast<uint>(sm), 0, &config);
-
-  if (pio_sm_set_consecutive_pindirs(
-          pio0,
-          static_cast<uint>(sm),
-          PIN_DRIVER_A_H,
-          4,
-          true) != 0) {
-    return false;
-  }
-
-  // Предустанавливаем NORMAL=1010 в выходном latch PIO до переключения GPIO mux.
-  pio_sm_set_pins_with_mask(
-      pio0,
-      static_cast<uint>(sm),
-      0b1010,
-      0x0F);
-
-  // Теперь включаем side-set и JMP PIN. Эти изменения конфигурации
-  // не исполняют PIO-инструкции и не меняют уже подготовленные уровни.
-  sm_config_set_sideset(&config, 4, false, false);
-  sm_config_set_sideset_pins(&config, PIN_DRIVER_A_H);
-  sm_config_set_jmp_pin(&config, PIN_PIO_FAULT_LINK);
-
-  if (pio_sm_set_config(pio0, static_cast<uint>(sm), &config) != 0) {
-    return false;
-  }
-
-  // GPIO переводятся на PIO0 уже с подготовленными направлениями и NORMAL.
-  for (uint8_t pin = PIN_DRIVER_A_H; pin <= PIN_DRIVER_B_L; ++pin) {
-    pio_gpio_init(pio0, pin);
-  }
-
-  // TX FIFO: Y — активная длительность, ISR — deadtime, OSR — межфазная пауза.
-  pio_sm_put_blocking(pio0, static_cast<uint>(sm), activeLoopCount);
-  pio_sm_put_blocking(pio0, static_cast<uint>(sm), driverLoopCount);
-  pio_sm_put_blocking(pio0, static_cast<uint>(sm), interphaseLoopCount);
-
-  pio_interrupt_clear(pio0, PIO_IRQ_STOP_REQUEST);
-  pio_interrupt_clear(pio0, PIO_IRQ_DRAIN_FAULT);
-  pio0->irq_force = (1u << PIO_IRQ_STOP_REQUEST);
-  pioRunPermissionApplied = false;
-
-  pio_sm_set_enabled(pio0, static_cast<uint>(sm), true);
-  return true;
-}
-
-// ======================================================
-// ИНИЦИАЛИЗАЦИЯ PIO-МОНИТОРА ДАТЧИКОВ СТОКОВ
-// ======================================================
-
-static bool initializeDrainMonitor() {
   const uint32_t systemClockHz = clock_get_hz(clk_sys);
 
   if (systemClockHz == 0 ||
@@ -736,85 +624,167 @@ static bool initializeDrainMonitor() {
     return false;
   }
 
-  if (!pio_can_add_program_at_offset(
-          pio1,
+  // Общая память PIO0: SM0 — адреса 0..16, SM1 — 17..29.
+  // Два слова из 32 остаются свободными.
+  if (!pio_can_add_program_at_offset(pio0, &ups_driver_program, 0) ||
+      !pio_can_add_program_at_offset(
+          pio0, &drain_monitor_program, DRAIN_MONITOR_PROGRAM_OFFSET)) {
+    return false;
+  }
+
+  // SM0 обязан быть ниже SM1: при аварии side-set SM1 должен иметь
+  // более высокий аппаратный приоритет на общих GP0..GP3.
+  const int generatorSm = pio_claim_unused_sm(pio0, false);
+  const int monitorSm = pio_claim_unused_sm(pio0, false);
+
+  if (generatorSm != 0 || monitorSm != 1) {
+    return false;
+  }
+
+  generatorPioSm = generatorSm;
+  drainMonitorSm = monitorSm;
+
+  if (pio_add_program_at_offset(pio0, &ups_driver_program, 0) != 0) {
+    return false;
+  }
+
+  if (pio_add_program_at_offset(
+          pio0,
           &drain_monitor_program,
-          0)) {
+          DRAIN_MONITOR_PROGRAM_OFFSET) != DRAIN_MONITOR_PROGRAM_OFFSET) {
     return false;
   }
 
-  const int sm = pio_claim_unused_sm(pio1, false);
-  if (sm < 0) {
-    return false;
-  }
-  drainMonitorSm = sm;
+  // PIO0 SM0 — генератор.
+  pio_sm_config generatorConfig = pio_get_default_sm_config();
 
-  const int programOffset =
-      pio_add_program_at_offset(pio1, &drain_monitor_program, 0);
-
-  if (programOffset != 0) {
-    return false;
-  }
-
-  // Сенсорные входы принадлежат PIO1 SM0; внешний аналоговый формирователь
-  // обязан задавать устойчивые логические уровни без плавающего состояния.
-  pio_gpio_init(pio1, PIN_DRAIN_A_FB);
-  pio_gpio_init(pio1, PIN_DRAIN_B_FB);
-  pio_gpio_init(pio1, PIN_PIO_FAULT_LINK);
-
-  pio_sm_config config = pio_get_default_sm_config();
-
-  sm_config_set_set_pins(&config, PIN_PIO_FAULT_LINK, 1);
-  sm_config_set_in_pins(&config, PIN_DRAIN_A_FB);
-  sm_config_set_in_shift(&config, true, false, 32);
-
+  sm_config_set_set_pins(&generatorConfig, PIN_DRIVER_A_H, 4);
   sm_config_set_wrap(
-      &config,
-      DRAIN_MONITOR_WRAP_TARGET,
-      DRAIN_MONITOR_WRAP);
+      &generatorConfig,
+      UPS_DRIVER_PIO_WRAP_TARGET,
+      UPS_DRIVER_PIO_WRAP);
+  sm_config_set_clkdiv_int_frac8(&generatorConfig, clockDivider, 0);
 
-  sm_config_set_clkdiv_int_frac8(
-      &config,
-      clockDivider,
-      0);
-
+  // Сначала инициализируем SM0 без side-set, чтобы безопасно
+  // выставить NORMAL в выходной защёлке до подключения GPIO к PIO.
   pio_sm_init(
-      pio1,
-      static_cast<uint>(sm),
-      0,
-      &config);
+      pio0,
+      static_cast<uint>(generatorSm),
+      UPS_DRIVER_PIO_WRAP_TARGET,
+      &generatorConfig);
 
   if (pio_sm_set_consecutive_pindirs(
-          pio1,
-          static_cast<uint>(sm),
-          PIN_PIO_FAULT_LINK,
-          1,
-          true) != 0) {
+          pio0, static_cast<uint>(generatorSm),
+          PIN_DRIVER_A_H, 4, true) != 0) {
     return false;
   }
 
-  // GP5 в норме удерживается LOW.
   pio_sm_set_pins_with_mask(
-      pio1,
-      static_cast<uint>(sm),
-      0,
-      0x01);
+      pio0,
+      static_cast<uint>(generatorSm),
+      0b1010,
+      0x0F);
 
+  sm_config_set_sideset(&generatorConfig, 4, false, false);
+  sm_config_set_sideset_pins(&generatorConfig, PIN_DRIVER_A_H);
+
+  if (pio_sm_set_config(
+          pio0,
+          static_cast<uint>(generatorSm),
+          &generatorConfig) != 0) {
+    return false;
+  }
+
+  for (uint8_t pin = PIN_DRIVER_A_H; pin <= PIN_DRIVER_B_L; ++pin) {
+    pio_gpio_init(pio0, pin);
+  }
+
+  // Y=активная длительность, ISR=dead time, OSR=межфазная пауза.
+  // Инициализация через EXEC не расходует слова памяти программы.
+  pio_sm_put_blocking(pio0, static_cast<uint>(generatorSm), activeLoopCount);
+  pio_sm_exec_wait_blocking(
+      pio0, static_cast<uint>(generatorSm), pio_encode_pull(false, true));
+  pio_sm_exec_wait_blocking(
+      pio0, static_cast<uint>(generatorSm),
+      pio_encode_mov(pio_y, pio_osr));
+
+  pio_sm_put_blocking(pio0, static_cast<uint>(generatorSm), driverLoopCount);
+  pio_sm_exec_wait_blocking(
+      pio0, static_cast<uint>(generatorSm), pio_encode_pull(false, true));
+  pio_sm_exec_wait_blocking(
+      pio0, static_cast<uint>(generatorSm),
+      pio_encode_mov(pio_isr, pio_osr));
+
+  pio_sm_put_blocking(pio0, static_cast<uint>(generatorSm), interphaseLoopCount);
+  pio_sm_exec_wait_blocking(
+      pio0, static_cast<uint>(generatorSm), pio_encode_pull(false, true));
+  pio_sm_exec_wait_blocking(
+      pio0, static_cast<uint>(generatorSm),
+      pio_encode_mov(pio_osr, pio_osr));
+
+  // PIO0 SM1 — монитор стоков и аварийный перехват.
+  pio_sm_config monitorConfig = pio_get_default_sm_config();
+
+  sm_config_set_set_pins(&monitorConfig, PIN_DRAIN_A_FB, 2);
+  sm_config_set_in_pins(&monitorConfig, PIN_DRAIN_A_FB);
+  sm_config_set_out_shift(&monitorConfig, true, false, 32);
+
+  // 5 бит поля: enable + четыре линии GP0..GP3.
+  // В штатных командах side-set выключен; в fault_hold включён.
+  sm_config_set_sideset(&monitorConfig, 5, true, false);
+  sm_config_set_sideset_pins(&monitorConfig, PIN_DRIVER_A_H);
+
+  sm_config_set_wrap(
+      &monitorConfig,
+      DRAIN_MONITOR_WRAP_TARGET,
+      DRAIN_MONITOR_WRAP);
+  sm_config_set_clkdiv_int_frac8(&monitorConfig, clockDivider, 0);
+
+  pio_sm_init(
+      pio0,
+      static_cast<uint>(monitorSm),
+      DRAIN_MONITOR_PROGRAM_OFFSET,
+      &monitorConfig);
+
+  if (pio_sm_set_consecutive_pindirs(
+          pio0, static_cast<uint>(monitorSm),
+          PIN_DRAIN_A_FB, 2, false) != 0) {
+    return false;
+  }
+
+  pio_gpio_init(pio0, PIN_DRAIN_A_FB);
+  pio_gpio_init(pio0, PIN_DRAIN_B_FB);
+
+  // ISR SM1 хранит четверть периода; Y сначала указывает на wait_b (24).
   pio_sm_put_blocking(
-      pio1,
-      static_cast<uint>(sm),
-      quarterCheckLoopCount);
+      pio0, static_cast<uint>(monitorSm), quarterCheckLoopCount);
+  pio_sm_exec_wait_blocking(
+      pio0, static_cast<uint>(monitorSm), pio_encode_pull(false, true));
+  pio_sm_exec_wait_blocking(
+      pio0, static_cast<uint>(monitorSm),
+      pio_encode_mov(pio_isr, pio_osr));
+  pio_sm_exec_wait_blocking(
+      pio0, static_cast<uint>(monitorSm),
+      pio_encode_set(pio_y, DRAIN_MONITOR_WAIT_B_PC));
 
-  pio_sm_set_enabled(
-      pio1,
-      static_cast<uint>(sm),
-      true);
+  pio_interrupt_clear(pio0, PIO_IRQ_STOP_REQUEST);
+  pio_interrupt_clear(pio0, PIO_IRQ_DRAIN_FAULT);
+
+  // Пока CPU не разрешит RUN, SM0 остаётся на границе периода в NORMAL.
+  pio0->irq_force = (1u << PIO_IRQ_STOP_REQUEST);
+  pioRunPermissionApplied = false;
+
+  // Оба автомата стартуют одновременно с одинаковым делителем.
+  pio_enable_sm_mask_in_sync(
+      pio0,
+      (1u << static_cast<uint>(generatorSm)) |
+      (1u << static_cast<uint>(monitorSm)));
 
   return true;
 }
 
-// PIO0 сначала сам переводит GP0..GP3 в NORMAL, затем выставляет IRQ1.
-// CPU только фиксирует ошибку и запрещает дальнейший запуск генератора.
+// SM1 уже аппаратно перевёл GP0..GP3 в NORMAL и удерживает их side-set.
+// CPU фиксирует аварию и останавливает SM0; SM1 оставляем в fault_hold.
 static void serviceGeneratorPioFault() {
   if (!pio_interrupt_get(pio0, PIO_IRQ_DRAIN_FAULT) ||
       generatorFaultLatched) {
@@ -828,12 +798,15 @@ static void serviceGeneratorPioFault() {
   pioRunPermissionApplied = false;
   generatorBlockFlags |= BLOCK_DRAIN_FAULT;
 
-  if (drainMonitorSm >= 0) {
+  if (generatorPioSm >= 0) {
     pio_sm_set_enabled(
-        pio1,
-        static_cast<uint>(drainMonitorSm),
+        pio0,
+        static_cast<uint>(generatorPioSm),
         false);
   }
+
+  // drainMonitorSm намеренно НЕ отключаем: SM1 продолжает аппаратно
+  // удерживать NORMAL на GP0..GP3 после остановки SM0.
 
   logEvent(
       "ERROR",
@@ -1015,7 +988,7 @@ void setup() {
   // Вход RUN без внутренней подтяжки — как в исходной версии.
   pinMode(PIN_RUN, INPUT);
 
-  // Датчики стоков — цифровые входы PIO1, GP27 и GP28.
+  // Датчики стоков — цифровые входы PIO0 SM1, GP27 и GP28.
   // Внешние формирователи должны выдавать определённые уровни 0/1.
   // АЦП RP2040: 12 бит, диапазон 0..4095.
   analogReadResolution(12);
@@ -1049,13 +1022,7 @@ void setup() {
     holdDriverOutputsInNormal();
   }
 
-  if (!initializeDrainMonitor()) {
-    logEvent("ERROR", "Не удалось запустить PIO-монитор датчиков стоков");
-    updateLogDisplay();
-    holdDriverOutputsInNormal();
-  }
-
-  // Первые отсчёты отбрасываем после настройки АЦП.
+   // Первые отсчёты отбрасываем после настройки АЦП.
   for (uint8_t i = 0; i < 4; ++i) {
     analogRead(PIN_BATTERY);
   }
@@ -1063,7 +1030,7 @@ void setup() {
   // Стартовая выдержка из исходной четырёхвыходной версии.
   delay(UPS_STARTUP_DELAY_MS);
 
-  // WS2812 на GP16 использует UART0 + DMA; PIO0/PIO1 для LED не заняты.
+  // WS2812 на GP16 использует UART0 + DMA; ни один PIO для LED не занят.
   // Ошибка RGB-индикатора не должна останавливать генератор или монитор.
   if (!initializeStatusLed()) {
     logEvent("LED", "Не удалось инициализировать RGB-индикатор");
