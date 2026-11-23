@@ -624,8 +624,7 @@ static bool initializePioGenerator() {
     return false;
   }
 
-  // Общая память PIO0: SM0 — адреса 0..16, SM1 — 17..29.
-  // Два слова из 32 остаются свободными.
+  // Общая память PIO0 полностью занята: SM0 — 0..16, SM1 — 17..31.
   if (!pio_can_add_program_at_offset(pio0, &ups_driver_program, 0) ||
       !pio_can_add_program_at_offset(
           pio0, &drain_monitor_program, DRAIN_MONITOR_PROGRAM_OFFSET)) {
@@ -685,22 +684,9 @@ static bool initializePioGenerator() {
       0b1010,
       0x0F);
 
-  sm_config_set_sideset(&generatorConfig, 4, false, false);
-  sm_config_set_sideset_pins(&generatorConfig, PIN_DRIVER_A_H);
-
-  if (pio_sm_set_config(
-          pio0,
-          static_cast<uint>(generatorSm),
-          &generatorConfig) != 0) {
-    return false;
-  }
-
-  for (uint8_t pin = PIN_DRIVER_A_H; pin <= PIN_DRIVER_B_L; ++pin) {
-    pio_gpio_init(pio0, pin);
-  }
-
-  // Y=активная длительность, ISR=dead time, OSR=межфазная пауза.
-  // Инициализация через EXEC не расходует слова памяти программы.
+  // Загружаем Y=активная длительность, ISR=dead time, OSR=межфазная пауза
+  // ДО включения обязательного side-set. Иначе EXEC-инструкции с нулевым
+  // side-set могли бы временно перезаписать выходы.
   pio_sm_put_blocking(pio0, static_cast<uint>(generatorSm), activeLoopCount);
   pio_sm_exec_wait_blocking(
       pio0, static_cast<uint>(generatorSm), pio_encode_pull(false, true));
@@ -718,9 +704,20 @@ static bool initializePioGenerator() {
   pio_sm_put_blocking(pio0, static_cast<uint>(generatorSm), interphaseLoopCount);
   pio_sm_exec_wait_blocking(
       pio0, static_cast<uint>(generatorSm), pio_encode_pull(false, true));
-  pio_sm_exec_wait_blocking(
-      pio0, static_cast<uint>(generatorSm),
-      pio_encode_mov(pio_osr, pio_osr));
+
+  sm_config_set_sideset(&generatorConfig, 4, false, false);
+  sm_config_set_sideset_pins(&generatorConfig, PIN_DRIVER_A_H);
+
+  if (pio_sm_set_config(
+          pio0,
+          static_cast<uint>(generatorSm),
+          &generatorConfig) != 0) {
+    return false;
+  }
+
+  for (uint8_t pin = PIN_DRIVER_A_H; pin <= PIN_DRIVER_B_L; ++pin) {
+    pio_gpio_init(pio0, pin);
+  }
 
   // PIO0 SM1 — монитор стоков и аварийный перехват.
   pio_sm_config monitorConfig = pio_get_default_sm_config();
@@ -755,7 +752,7 @@ static bool initializePioGenerator() {
   pio_gpio_init(pio0, PIN_DRAIN_A_FB);
   pio_gpio_init(pio0, PIN_DRAIN_B_FB);
 
-  // ISR SM1 хранит четверть периода; Y сначала указывает на wait_b (24).
+  // ISR SM1 хранит четверть периода; он одинаково используется для A и B.
   pio_sm_put_blocking(
       pio0, static_cast<uint>(monitorSm), quarterCheckLoopCount);
   pio_sm_exec_wait_blocking(
@@ -763,9 +760,6 @@ static bool initializePioGenerator() {
   pio_sm_exec_wait_blocking(
       pio0, static_cast<uint>(monitorSm),
       pio_encode_mov(pio_isr, pio_osr));
-  pio_sm_exec_wait_blocking(
-      pio0, static_cast<uint>(monitorSm),
-      pio_encode_set(pio_y, DRAIN_MONITOR_WAIT_B_PC));
 
   pio_interrupt_clear(pio0, PIO_IRQ_STOP_REQUEST);
   pio_interrupt_clear(pio0, PIO_IRQ_DRAIN_FAULT);
