@@ -1,33 +1,40 @@
+; ArduinoUPS RP2040-Zero — контроль датчиков стоков.
+; PIO0 SM1. Программа загружается по адресу 17..29 в общую память PIO0.
+; GP0/GP2 — наблюдение за началом активных интервалов A/B.
+; GP27/GP28 — два датчика стоков.
+; При 00 SM1 аппаратно перехватывает GP0..GP3 через optional side-set:
+; SM1 имеет более высокий приоритет вывода, чем SM0.
+
 .program drain_monitor
+.side_set 4 opt
 
-; GP27=DRAIN_A_FB, GP28=DRAIN_B_FB (IN BASE задан в конфигурации SM).
-; GP0 и GP2 — реальные выходные команды PIO0 на драйверы.
-; GP5 — внутренняя линия аварии PIO1 -> PIO0.
-
-pull block
-wait 1 gpio 0
-mov x, osr
+.wrap_target
+wait_a:
+    wait 1 gpio 0
+    mov x, isr
 quarter_a_delay:
-jmp x--, quarter_a_delay
-mov isr, null
-in pins, 2
-mov x, isr
-jmp !x, fault
+    jmp x--, quarter_a_delay
 
-wait 0 gpio 0
-wait 1 gpio 2
-mov x, osr
-quarter_b_delay:
-jmp x--, quarter_b_delay
-mov isr, null
-in pins, 2
-mov x, isr
-jmp !x, fault
+    ; PINS: bit0=GP27, bit1=GP28.
+    ; OUT X,2 оставляет в X только эти два бита.
+    mov osr, pins
+    out x, 2
+    jmp !x, fault
 
-wait 0 gpio 2
-jmp 1
+    ; Y хранит абсолютный адрес следующего ожидаемого фронта.
+    mov pc, y
+
+wait_b:
+    wait 1 gpio 2
+    set y, 17
+    mov x, isr
+    jmp quarter_a_delay
 
 fault:
-set pins, 1
+    ; Side-set NORMAL и IRQ1 устанавливаются одной инструкцией.
+    irq set 1 side 0b1010
+
 fault_hold:
-jmp fault_hold
+    ; SM1 непрерывно удерживает NORMAL и выигрывает арбитраж GP0..GP3.
+    jmp fault_hold side 0b1010
+.wrap
