@@ -53,6 +53,10 @@ SSD1306 128×64, I2C, адрес по умолчанию 0x3C.
 
 FQBN для Arduino CLI: rp2040:rp2040:waveshare_rp2040_zero.
 
+Сборка из корня репозитория:
+
+    arduino-cli compile --fqbn rp2040:rp2040:waveshare_rp2040_zero ZeroCounter
+
 Нужен именно RP2040 Arduino core с Pico SDK headers (hardware/pwm.h, hardware/irq.h). Скетч не предназначен для AVR/GyverCore.
 
 Внешние библиотеки не требуются: используется только стандартная Wire из выбранного ядра.

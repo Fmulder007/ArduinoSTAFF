@@ -204,7 +204,7 @@ static void multiplyFractionDivide(uint64_t a,
 }
 
 // Округление результата до ближайшего целого герца.
-// Реализовано без float/double и без 128-битной арифметики.
+// Все вычисления выполняются целочисленно.
 static uint64_t multiplyDivideRound(uint64_t a,
                                     uint32_t b,
                                     uint64_t divisor) {
