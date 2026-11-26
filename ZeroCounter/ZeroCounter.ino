@@ -2,10 +2,6 @@
   ZeroCounter — частотомер для Waveshare RP2040-Zero
   Версия 0.2.0
 
-  Исправление 2026-11-26 13:25:06 (+10:00), строки 553–555:
-    начальные значения входного и опорного счётчиков фиксируются
-    из текущих inputNow/referenceNow вместо предыдущего снимка.
-
   Сейчас реализован только ВЧ-вход B.
   НЧ-вход A будет добавлен отдельно.
 
@@ -550,9 +546,9 @@ void loop() {
     // Начало нового измерения — снимок непосредственно
     // перед первым обнаруженным изменением счётчика.
     if (!measuring) {
-      measurementStartInput = inputNow;
-      measurementStartReference = referenceNow;
-      lastUpdateReference = referenceNow;
+      measurementStartInput = previousInputCount;
+      measurementStartReference = previousReferenceCount;
+      lastUpdateReference = previousReferenceCount;
       measuring = true;
       displayedFrequencyHz = 0;
     }
