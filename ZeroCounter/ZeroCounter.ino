@@ -2,6 +2,10 @@
   ZeroCounter — частотомер для Waveshare RP2040-Zero
   Версия 0.2.0
 
+  Изменение 2026-11-26 13:36:32 (+10:00), строки 79–81, 298–312, 438–445:
+    OLED переведён на I2C1 (Wire1), GP14/GP15, скорость 100 кГц.
+    Все обращения OLED-драйвера используют макрос OLED_WIRE.
+
   Сейчас реализован только ВЧ-вход B.
   НЧ-вход A будет добавлен отдельно.
 
@@ -71,9 +75,10 @@
 // РАСПИНОВКА RP2040-ZERO
 // ============================================================
 
-// OLED SSD1306, I2C0.
-#define PIN_OLED_SDA       4
-#define PIN_OLED_SCL       5
+// Шина дисплея: I2C1 (GP14/GP15).
+#define OLED_WIRE          Wire1
+#define PIN_OLED_SDA       14
+#define PIN_OLED_SCL       15
 #define OLED_I2C_ADDRESS   0x3C
 
 // Вход B: выход внешнего ВЧ-прескалера.
@@ -290,21 +295,21 @@ static const uint8_t glyphE[5] = {0x7F, 0x49, 0x49, 0x49, 0x41};
 static const uint8_t glyphF[5] = {0x7F, 0x09, 0x09, 0x09, 0x01};
 
 static void oledCommandList(const uint8_t *commands, size_t count) {
-  Wire.beginTransmission(OLED_I2C_ADDRESS);
-  Wire.write(0x00);
+  OLED_WIRE.beginTransmission(OLED_I2C_ADDRESS);
+  OLED_WIRE.write(0x00);
 
   for (size_t i = 0; i < count; ++i) {
-    Wire.write(commands[i]);
+    OLED_WIRE.write(commands[i]);
   }
 
-  Wire.endTransmission();
+  OLED_WIRE.endTransmission();
 }
 
 static void oledBegin() {
-  Wire.setSDA(PIN_OLED_SDA);
-  Wire.setSCL(PIN_OLED_SCL);
-  Wire.begin();
-  Wire.setClock(400000);
+  OLED_WIRE.setSDA(PIN_OLED_SDA);
+  OLED_WIRE.setSCL(PIN_OLED_SCL);
+  OLED_WIRE.begin();
+  OLED_WIRE.setClock(100000);
 
   const uint8_t initCommands[] = {
     0xAE,       // Display OFF
@@ -430,14 +435,14 @@ static void oledFlush() {
     const size_t remaining = sizeof(oledBuffer) - offset;
     const size_t chunk = (remaining > 31) ? 31 : remaining;
 
-    Wire.beginTransmission(OLED_I2C_ADDRESS);
-    Wire.write(0x40);
+    OLED_WIRE.beginTransmission(OLED_I2C_ADDRESS);
+    OLED_WIRE.write(0x40);
 
     for (size_t i = 0; i < chunk; ++i) {
-      Wire.write(oledBuffer[offset + i]);
+      OLED_WIRE.write(oledBuffer[offset + i]);
     }
 
-    Wire.endTransmission();
+    OLED_WIRE.endTransmission();
   }
 }
 
