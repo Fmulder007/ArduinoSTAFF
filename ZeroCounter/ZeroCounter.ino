@@ -1,6 +1,6 @@
 /*
   ZeroCounter — частотомер для Waveshare RP2040-Zero
-  Версия 0.1.0
+  Версия 0.2.0
 
   Сейчас реализован только ВЧ-вход B.
   НЧ-вход A будет добавлен отдельно.
@@ -9,8 +9,12 @@
     - Вход B: аппаратный счётчик фронтов PWM после внешнего прескалера.
     - Опора: отдельный аппаратный счётчик фронтов PWM от TCXO.
     - Частота = delta_B * PRESCALER_K * REF_FREQ_HZ / delta_REF.
-    - Счётчики работают непрерывно; обнуление измерительной базы
-      происходит только после пропадания входных импульсов.
+    - Измерение накопительное: пока сигнал не пропадает, база копится,
+      а показания обновляются на границах опорного окна — каждые
+      GATE_REF_COUNTS периодов TCXO. С каждым обновлением точность
+      растёт (±1 импульс опоры и ±1 импульс входа на всю базу).
+    - Обнуление измерительной базы происходит только после
+      пропадания входных импульсов.
 
   Требуется Arduino-Pico core by Earle F. Philhower.
 */
@@ -28,11 +32,27 @@
 // ПОЛЬЗОВАТЕЛЬСКИЕ НАСТРОЙКИ
 // ============================================================
 
-// Частота внешнего TCXO, Гц.
+// Частота внешнего TCXO, Гц. Значение может быть любым целым —
+// сюда вносится фактическая, калиброванная частота опоры,
+// например 9999987UL. Она используется непосредственно в
+// формуле пересчёта частоты, а не как номинал.
 #define REF_FREQ_HZ       10000000UL
 
 // Коэффициент внешнего прескалера на входе B.
 #define PRESCALER_K       64UL
+
+// Ориентировочная длительность опорного окна, мс.
+#define GATE_MS           100UL
+
+// Окно счёта в импульсах опоры: REF_FREQ_HZ * GATE_MS / 1000.
+// Приведение к uint64_t обязательно: произведение может
+// достигать 4e10 и не помещается в 32-битный unsigned long.
+// Каст допустим, потому что макрос используется только в
+// рантайме — препроцессорных проверок с ним больше нет.
+// Усечение деления (если REF_FREQ_HZ не кратен 1000) на точность
+// не влияет: длина окна лишь чуть отличается от задуманной,
+// а в формуле участвует фактическое число импульсов опоры.
+#define GATE_REF_COUNTS   ((uint64_t)REF_FREQ_HZ * GATE_MS / 1000UL)
 
 #if (REF_FREQ_HZ < 4000000UL) || (REF_FREQ_HZ > 40000000UL)
   #error "REF_FREQ_HZ must be in range 4000000...40000000 Hz"
@@ -41,6 +61,11 @@
 #if (PRESCALER_K < 1UL) || (PRESCALER_K > 256UL)
   #error "PRESCALER_K must be in range 1...256"
 #endif
+
+#if (GATE_MS < 1UL)
+  #error "GATE_MS must be at least 1 ms"
+#endif
+
 
 // ============================================================
 // РАСПИНОВКА RP2040-ZERO
@@ -464,6 +489,10 @@ static uint64_t previousReferenceCount = 0;
 static uint64_t measurementStartInput = 0;
 static uint64_t measurementStartReference = 0;
 
+// Снимок опорного счётчика на момент последнего обновления
+// показаний: границы обновлений привязаны к опоре.
+static uint64_t lastUpdateReference = 0;
+
 static uint32_t lastPulseMs = 0;
 static uint32_t lastDisplayMs = 0;
 
@@ -519,6 +548,7 @@ void loop() {
     if (!measuring) {
       measurementStartInput = previousInputCount;
       measurementStartReference = previousReferenceCount;
+      lastUpdateReference = previousReferenceCount;
       measuring = true;
       displayedFrequencyHz = 0;
     }
@@ -527,7 +557,7 @@ void loop() {
   previousInputCount = inputNow;
   previousReferenceCount = referenceNow;
 
-  // Если входные импульсы пропали, завершаем накопление.
+  // Сигнал пропал — измерение завершено, база обнуляется.
   if (measuring &&
       (uint32_t)(now - lastPulseMs) >= SIGNAL_TIMEOUT_MS) {
     measuring = false;
@@ -535,11 +565,12 @@ void loop() {
     countSinceDisplay = false;
   }
 
-  // OLED обновляется 10 раз в секунду.
-  if ((uint32_t)(now - lastDisplayMs) >= DISPLAY_INTERVAL_MS) {
-    lastDisplayMs += DISPLAY_INTERVAL_MS;
-
-    if (measuring) {
+  // Показания обновляются на границах опорного окна:
+  // каждые GATE_REF_COUNTS периодов опоры. Само измерение
+  // при этом НЕ закрывается — база копится, пока идёт сигнал,
+  // и точность показаний растёт со временем измерения.
+  if (measuring) {
+    if (referenceNow - lastUpdateReference >= GATE_REF_COUNTS) {
       const uint64_t deltaInput =
           inputNow - measurementStartInput;
 
@@ -564,9 +595,15 @@ void loop() {
       } else {
         displayedFrequencyHz = 0;
       }
-    } else {
-      displayedFrequencyHz = 0;
+
+      lastUpdateReference = referenceNow;
+      countSinceDisplay = true;
     }
+  }
+
+  // Перерисовка OLED раз в DISPLAY_INTERVAL_MS.
+  if ((uint32_t)(now - lastDisplayMs) >= DISPLAY_INTERVAL_MS) {
+    lastDisplayMs += DISPLAY_INTERVAL_MS;
 
     const bool referenceReady =
         (digitalRead(PIN_REF_READY) == HIGH);
