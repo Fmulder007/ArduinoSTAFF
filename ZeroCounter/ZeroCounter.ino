@@ -45,6 +45,9 @@
 // Коэффициент внешнего прескалера на входе B.
 #define PRESCALER_K       64UL
 
+// Высота OLED SSD1306: 32 или 64 пикселя.
+#define OLED_HEIGHT        32
+
 // Ориентировочная длительность опорного окна, мс.
 #define GATE_MS           100UL
 
@@ -68,6 +71,10 @@
 
 #if (GATE_MS < 1UL)
   #error "GATE_MS must be at least 1 ms"
+#endif
+
+#if (OLED_HEIGHT != 32) && (OLED_HEIGHT != 64)
+  #error "OLED_HEIGHT must be 32 or 64"
 #endif
 
 
@@ -270,7 +277,7 @@ static uint64_t multiplyDivideRound(uint64_t a,
 // Без Adafruit_GFX и дополнительных библиотек.
 // ============================================================
 
-static uint8_t oledBuffer[128 * 64 / 8];
+static uint8_t oledBuffer[128 * OLED_HEIGHT / 8];
 
 static const uint8_t digitFont[10][5] = {
   {0x3E, 0x51, 0x49, 0x45, 0x3E}, // 0
@@ -314,14 +321,14 @@ static void oledBegin() {
   const uint8_t initCommands[] = {
     0xAE,       // Display OFF
     0xD5, 0x80, // Clock divide
-    0xA8, 0x3F, // Multiplex 1/64
+    0xA8, OLED_HEIGHT - 1, // Multiplex: 1/32 или 1/64
     0xD3, 0x00, // Display offset
     0x40,       // Start line 0
     0x8D, 0x14, // Charge pump ON
     0x20, 0x00, // Horizontal addressing mode
     0xA1,       // Segment remap
     0xC8,       // COM scan direction
-    0xDA, 0x12, // COM pins
+    0xDA, (OLED_HEIGHT == 32 ? 0x02 : 0x12), // COM pins
     0x81, 0x7F, // Contrast
     0xD9, 0xF1, // Pre-charge
     0xDB, 0x40, // VCOMH
@@ -338,7 +345,7 @@ static void oledClear() {
 }
 
 static void oledPixel(int x, int y) {
-  if (x < 0 || x >= 128 || y < 0 || y >= 64) {
+  if (x < 0 || x >= 128 || y < 0 || y >= OLED_HEIGHT) {
     return;
   }
 
@@ -424,7 +431,7 @@ static void oledDrawIndicator(int cx, int cy, bool active) {
 static void oledFlush() {
   const uint8_t addressCommands[] = {
     0x21, 0x00, 0x7F, // Column address 0..127
-    0x22, 0x00, 0x07  // Page address 0..7
+    0x22, 0x00, (OLED_HEIGHT / 8) - 1 // Page address
   };
 
   oledCommandList(addressCommands, sizeof(addressCommands));
@@ -451,6 +458,14 @@ static void oledShowFrequency(uint32_t frequencyHz,
                               bool referenceReady) {
   oledClear();
 
+#if OLED_HEIGHT == 32
+  const int frequencyY = 1;
+  const int statusY = 23;
+#else
+  const int frequencyY = 3;
+  const int statusY = 50;
+#endif
+
   // Девять цифр всегда остаются на одном месте.
   // Между цифрами внутри тройки — 2 пикселя,
   // между группами тысяч — 8 пикселей.
@@ -465,7 +480,7 @@ static void oledShowFrequency(uint32_t frequencyHz,
   int x = 5;
 
   for (uint8_t i = 0; i < 9; ++i) {
-    oledDrawDigit((uint8_t)(digits[i] - '0'), x, 3, 2);
+    oledDrawDigit((uint8_t)(digits[i] - '0'), x, frequencyY, 2);
     x += 12;
 
     if (i == 2 || i == 5) {
@@ -473,13 +488,12 @@ static void oledShowFrequency(uint32_t frequencyHz,
     }
   }
 
-  oledDrawText("HZ", 58, 21);
+  // Нижняя строка: подписи и индикаторы счётчика и опоры.
+  oledDrawText("CNT", 16, statusY);
+  oledDrawIndicator(43, statusY + 3, countActive);
 
-  oledDrawText("CNT", 16, 50);
-  oledDrawIndicator(43, 53, countActive);
-
-  oledDrawText("REF", 79, 50);
-  oledDrawIndicator(106, 53, referenceReady);
+  oledDrawText("REF", 79, statusY);
+  oledDrawIndicator(106, statusY + 3, referenceReady);
 
   oledFlush();
 }
