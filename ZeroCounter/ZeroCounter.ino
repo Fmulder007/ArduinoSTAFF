@@ -103,6 +103,7 @@
 // Период обновления индикации и тайм-аут пропадания импульсов.
 #define DISPLAY_INTERVAL_MS  100UL
 #define SIGNAL_TIMEOUT_MS    100UL
+#define CNT_BLINK_INTERVAL_MS 250UL // Переключение каждые 250 мс: 2 мигания в секунду.
 
 static_assert((PIN_INPUT_B & 1u) == 1u,
               "PIN_INPUT_B must be a PWM channel B pin");
@@ -412,19 +413,19 @@ static void oledDrawText(const char *text, int x, int y) {
 }
 
 static void oledDrawIndicator(int cx, int cy, bool active) {
-  const int radius = 3;
-  const int radiusSquared = radius * radius;
-  const int innerSquared = (radius - 1) * (radius - 1);
+  // Квадрат 7x7 пикселей: залитый или только контур.
+  const int halfSize = 3;
 
-  for (int dy = -radius; dy <= radius; ++dy) {
-    for (int dx = -radius; dx <= radius; ++dx) {
-      const int distanceSquared = dx * dx + dy * dy;
+  if (active) {
+    oledFillRect(cx - halfSize, cy - halfSize, 7, 7);
+    return;
+  }
 
-      if (distanceSquared <= radiusSquared &&
-          (active || distanceSquared >= innerSquared)) {
-        oledPixel(cx + dx, cy + dy);
-      }
-    }
+  for (int offset = -halfSize; offset <= halfSize; ++offset) {
+    oledPixel(cx + offset, cy - halfSize);
+    oledPixel(cx + offset, cy + halfSize);
+    oledPixel(cx - halfSize, cy + offset);
+    oledPixel(cx + halfSize, cy + offset);
   }
 }
 
@@ -516,7 +517,8 @@ static uint32_t lastPulseMs = 0;
 static uint32_t lastDisplayMs = 0;
 
 static bool measuring = false;
-static bool countSinceDisplay = false;
+static bool cntBlinkOn = false;
+static uint32_t lastCntBlinkMs = 0;
 
 static uint32_t displayedFrequencyHz = 0;
 
@@ -560,7 +562,6 @@ void loop() {
   // Обнаружили новые импульсы на входе B.
   if (inputNow != previousInputCount) {
     lastPulseMs = now;
-    countSinceDisplay = true;
 
     // Начало нового измерения — снимок непосредственно
     // перед первым обнаруженным изменением счётчика.
@@ -569,6 +570,8 @@ void loop() {
       measurementStartReference = previousReferenceCount;
       lastUpdateReference = previousReferenceCount;
       measuring = true;
+      cntBlinkOn = true;
+      lastCntBlinkMs = now;
       displayedFrequencyHz = 0;
     }
   }
@@ -580,8 +583,19 @@ void loop() {
   if (measuring &&
       (uint32_t)(now - lastPulseMs) >= SIGNAL_TIMEOUT_MS) {
     measuring = false;
+    cntBlinkOn = false;
     displayedFrequencyHz = 0;
-    countSinceDisplay = false;
+  }
+
+  // CNT мигает только во время активного измерения.
+  // Полный цикл (включено + выключено) занимает 500 мс.
+  if (measuring) {
+    while ((uint32_t)(now - lastCntBlinkMs) >= CNT_BLINK_INTERVAL_MS) {
+      lastCntBlinkMs += CNT_BLINK_INTERVAL_MS;
+      cntBlinkOn = !cntBlinkOn;
+    }
+  } else {
+    cntBlinkOn = false;
   }
 
   // Показания обновляются на границах опорного окна:
@@ -616,7 +630,6 @@ void loop() {
       }
 
       lastUpdateReference = referenceNow;
-      countSinceDisplay = true;
     }
   }
 
@@ -628,9 +641,7 @@ void loop() {
         (digitalRead(PIN_REF_READY) == HIGH);
 
     oledShowFrequency(displayedFrequencyHz,
-                      countSinceDisplay,
+                      cntBlinkOn,
                       referenceReady);
-
-    countSinceDisplay = false;
   }
 }
